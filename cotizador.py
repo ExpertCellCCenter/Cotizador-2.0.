@@ -170,7 +170,7 @@ def generar_folio(fecha: datetime) -> str:
 
 
 # ----------------------------------------------------
-# CREACIÓN DEL PDF (ESTÉTICA AT&T)
+# CREACIÓN DEL PDF 
 # ----------------------------------------------------
 def crear_pdf_cotizacion(
     ejecutivo,
@@ -714,7 +714,7 @@ with col_der:
     )
     st.text_input("Teléfono del cliente (opcional):")
     st.session_state["comentarios"] = st.text_area(
-        "Comentarios (se incluyen en el PDF):",
+        "Comentarios:",
         value=st.session_state["comentarios"],
         height=80,
     )
@@ -849,3 +849,4 @@ else:
         file_name="cotizacion_att.pdf",
         mime="application/pdf",
     )
+
