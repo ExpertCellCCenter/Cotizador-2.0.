@@ -170,20 +170,28 @@ def generar_folio(fecha: datetime) -> str:
 
 
 # ----------------------------------------------------
-# CREACIÓN DEL PDF 
+# CREACIÓN DEL PDF (ESTÉTICA AT&T)
 # ----------------------------------------------------
 def crear_pdf_cotizacion(
     ejecutivo,
     attuid,
     cliente,
+    cliente_tel,
+    cliente_email,
+    cliente_dir,
     dias_validez,
+    valido_hasta_str,
     equipos,
     planes_incluidos,
     comentarios,
+    fichas_tecnicas=None,
 ) -> bytes:
     """
     Crea un PDF en memoria con formato muy similar al original de AT&T.
     """
+    if fichas_tecnicas is None:
+        fichas_tecnicas = []
+
     buffer = BytesIO()
 
     # Márgenes MUY pequeños
@@ -262,7 +270,7 @@ def crear_pdf_cotizacion(
 
     hoy = datetime.now()
     fecha_str = hoy.strftime("%d/%m/%Y")
-    valido_hasta_fecha = (hoy + timedelta(days=dias_validez)).strftime("%d/%m/%Y")
+    valido_hasta_text = valido_hasta_str or "—"
     folio = generar_folio(hoy)
 
     # ------------------ BARRA CIAN SUPERIOR ------------------
@@ -289,9 +297,13 @@ def crear_pdf_cotizacion(
     if logo_flowable:
         left_header.append(logo_flowable)
     left_header.append(Paragraph("Distribuidor Autorizado", styles["HeaderSmall"]))
+
     # Estas proporciones se escalan al ancho
     header_widths = scale_widths([70, 50, 50])
-    left_table = Table([left_header], colWidths=[header_widths[0] * 0.45, header_widths[0] * 0.55])
+    left_table = Table(
+        [left_header],
+        colWidths=[header_widths[0] * 0.45, header_widths[0] * 0.55],
+    )
     left_table.setStyle(
         TableStyle(
             [
@@ -300,9 +312,19 @@ def crear_pdf_cotizacion(
         )
     )
 
+    # Datos del cliente en el centro
     cliente_label = "<b>CLIENTE</b>"
     cliente_nombre = cliente or "—"
-    center_html = f"{cliente_label}<br/>{cliente_nombre}"
+    tel_str = cliente_tel or "—"
+    email_str = cliente_email or "—"
+    dir_str = cliente_dir or "—"
+
+    center_html = (
+        f"{cliente_label}<br/>{cliente_nombre}<br/>"
+        f"Tel: {tel_str}<br/>"
+        f"Email: {email_str}<br/>"
+        f"Dirección: {dir_str}"
+    )
     center_para = Paragraph(center_html, styles["HeaderCenter"])
 
     header_right_text = (
@@ -340,7 +362,7 @@ def crear_pdf_cotizacion(
 
     # ------------------ VÁLIDO HASTA ------------------
     story.append(
-        Paragraph(f"Válido hasta: <b>{valido_hasta_fecha}</b>", styles["Normal"])
+        Paragraph(f"Válido hasta: <b>{valido_hasta_text}</b>", styles["Normal"])
     )
     story.append(Spacer(1, 4))
 
@@ -452,7 +474,7 @@ def crear_pdf_cotizacion(
 
     # Anchos base en mm escalados al ancho útil (se estira hasta los márgenes)
     col_widths_equipos = scale_widths(
-        [55, 20, 20, 17, 12, 12, 18, 15, 15]
+        [53, 20, 20, 17, 12, 12, 18, 15, 17]
     )
 
     tabla_equipos = Table(
@@ -470,7 +492,7 @@ def crear_pdf_cotizacion(
                 ("ALIGN", (0, 1), (0, -1), "LEFT"),
                 ("ALIGN", (7, 1), (7, -1), "LEFT"),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("FONTSIZE", (0, 0), (-1, -1), 8),   # un poco más grande
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
                 ("TOPPADDING", (0, 0), (-1, -1), 2),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
                 ("WORDWRAP", (0, 0), (-1, -1), "CJK"),
@@ -522,9 +544,51 @@ def crear_pdf_cotizacion(
         story.append(tabla_planes)
         story.append(Spacer(1, 6))
 
-    # ------------------ FOOTER (LOGO + BARRA AL FONDO) ------------------
-    valido_hasta_text = valido_hasta_fecha
+    
 
+        # ------------------ FICHAS TÉCNICAS / IMÁGENES ------------------
+    # Solo se muestran si el usuario sube al menos una imagen.
+    # Sin título y sin cuadros/bordes de slots.
+    if fichas_tecnicas and len(fichas_tecnicas) > 0:
+        max_slots = min(3, len(fichas_tecnicas))  # 1, 2 o 3 imágenes reales
+        slot_widths = [doc.width / max_slots] * max_slots
+        slot_height = 45 * mm
+
+        cells = []
+        for i in range(max_slots):
+            img_bytes = fichas_tecnicas[i]
+            img_stream = BytesIO(img_bytes)
+            img = Image(img_stream)
+            # Limitar tamaño para que no se salgan del renglón
+            img._restrictSize(slot_widths[i], slot_height)
+            cells.append(img)
+
+        tabla_fichas = Table(
+            [cells],
+            colWidths=slot_widths,
+            rowHeights=[slot_height],
+        )
+        tabla_fichas.setStyle(
+            TableStyle(
+                [
+                    # SIN GRID → sin recuadros ni líneas
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("TOPPADDING", (0, 0), (-1, -1), 0),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ]
+            )
+        )
+        story.append(tabla_fichas)
+        story.append(Spacer(1, 8))
+
+    
+    
+
+
+    # ------------------ FOOTER (LOGO + BARRA AL FONDO) ------------------
     def add_footer(canvas, doc_):
         canvas.saveState()
         page_width, page_height = letter
@@ -579,10 +643,20 @@ if "equipos_cotizacion" not in st.session_state:
     st.session_state["equipos_cotizacion"] = []
 if "cliente" not in st.session_state:
     st.session_state["cliente"] = ""
+if "cliente_tel" not in st.session_state:
+    st.session_state["cliente_tel"] = ""
+if "cliente_email" not in st.session_state:
+    st.session_state["cliente_email"] = ""
+if "cliente_dir" not in st.session_state:
+    st.session_state["cliente_dir"] = ""
 if "dias_validez" not in st.session_state:
     st.session_state["dias_validez"] = 7
+if "fecha_validez_str" not in st.session_state:
+    st.session_state["fecha_validez_str"] = ""
 if "comentarios" not in st.session_state:
     st.session_state["comentarios"] = ""
+if "fichas_tecnicas" not in st.session_state:
+    st.session_state["fichas_tecnicas"] = []
 
 
 # ----------------------------------------------------
@@ -712,12 +786,34 @@ with col_der:
         "Nombre del cliente:",
         value=st.session_state["cliente"],
     )
-    st.text_input("Teléfono del cliente (opcional):")
+    st.session_state["cliente_tel"] = st.text_input(
+        "Teléfono del cliente:",
+        value=st.session_state["cliente_tel"],
+    )
+    st.session_state["cliente_email"] = st.text_input(
+        "Correo electrónico del cliente:",
+        value=st.session_state["cliente_email"],
+    )
+    st.session_state["cliente_dir"] = st.text_area(
+        "Dirección del cliente:",
+        value=st.session_state["cliente_dir"],
+        height=60,
+    )
     st.session_state["comentarios"] = st.text_area(
-        "Comentarios:",
+        "Comentarios (se incluyen en el PDF):",
         value=st.session_state["comentarios"],
         height=80,
     )
+
+    fichas_files = st.file_uploader(
+        "Fichas técnicas (hasta 3 imágenes):",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+    )
+    if fichas_files:
+        st.session_state["fichas_tecnicas"] = [
+            f.getvalue() for f in fichas_files[:3]
+        ]
 
 # ----------------------------------------------------
 # TABLA DE EQUIPOS
@@ -746,18 +842,19 @@ else:
     )
 
     st.dataframe(
-        df_mostrar.style.format(
-            {
-                "PRECIO LISTA": "${:,.2f}",
-                "PROMOCIÓN": "${:,.2f}",
-                "AHORRO": "${:,.2f}",
-                "ENGANCHE": "${:,.2f}",
-                "EQUIPO + PLAN": "${:,.2f}",
-                "% ENG": "{:.0f}%",
-            }
-        ),
-        width="stretch",
-    )
+    df_mostrar.style.format(
+        {
+            "PRECIO LISTA": "${:,.2f}",
+            "PROMOCIÓN": "${:,.2f}",
+            "AHORRO": "${:,.2f}",
+            "ENGANCHE": "${:,.2f}",
+            "EQUIPO + PLAN": "${:,.2f}",
+            "% ENG": "{:.0f}%",
+        }
+    ),
+    width="stretch",
+)
+
 
     col_b1, col_b2, col_b3 = st.columns(3)
     with col_b1:
@@ -775,8 +872,13 @@ else:
         if st.button("Nueva cotización"):
             st.session_state["equipos_cotizacion"] = []
             st.session_state["cliente"] = ""
+            st.session_state["cliente_tel"] = ""
+            st.session_state["cliente_email"] = ""
+            st.session_state["cliente_dir"] = ""
             st.session_state["dias_validez"] = 7
+            st.session_state["fecha_validez_str"] = ""
             st.session_state["comentarios"] = ""
+            st.session_state["fichas_tecnicas"] = []
             st.info(
                 "Se inició una nueva cotización (se conservarán ejecutivo, ATTUID y archivo)."
             )
@@ -800,13 +902,22 @@ if len(st.session_state["equipos_cotizacion"]) > 0:
     else:
         vigencia_global = last_day_of_month(today)
 
-    dias_validez_global = max(1, (vigencia_global - today).days + 1)
-    st.session_state["dias_validez"] = dias_validez_global
+    # Días reales restantes (inclusive)
+    dias_restantes = max(1, (vigencia_global - today).days + 1)
+
+    # Regla de negocio: la cotización no puede exceder 7 días
+    dias_validez_pdf = min(dias_restantes, 7)
+
+    # Fecha efectiva de vigencia (no excede ni la vigencia global ni los 7 días)
+    vigencia_efectiva = today + timedelta(days=dias_validez_pdf - 1)
+
+    st.session_state["dias_validez"] = dias_validez_pdf
+    st.session_state["fecha_validez_str"] = vigencia_efectiva.strftime("%d/%m/%Y")
 
     st.markdown(
         f"**Vigencia de la cotización:** hasta "
-        f"{vigencia_global.strftime('%d/%m/%Y')} "
-        f"({dias_validez_global} días)."
+        f"{st.session_state['fecha_validez_str']} "
+        f"({dias_validez_pdf} días)."
     )
 
     df_planes_incl = (
@@ -837,10 +948,15 @@ else:
         ejecutivo=st.session_state["ejecutivo"],
         attuid=st.session_state["attuid"],
         cliente=st.session_state["cliente"],
+        cliente_tel=st.session_state["cliente_tel"],
+        cliente_email=st.session_state["cliente_email"],
+        cliente_dir=st.session_state["cliente_dir"],
         dias_validez=st.session_state["dias_validez"],
+        valido_hasta_str=st.session_state["fecha_validez_str"],
         equipos=st.session_state["equipos_cotizacion"],
         planes_incluidos=planes_incluidos,
         comentarios=st.session_state["comentarios"],
+        fichas_tecnicas=st.session_state.get("fichas_tecnicas", []),
     )
 
     st.download_button(
@@ -849,4 +965,3 @@ else:
         file_name="cotizacion_att.pdf",
         mime="application/pdf",
     )
-
