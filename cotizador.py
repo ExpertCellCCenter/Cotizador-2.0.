@@ -30,6 +30,20 @@ st.set_page_config(
 )
 
 # ----------------------------------------------------
+# AUTH UTILS (login)
+# ----------------------------------------------------
+def get_auth_credentials():
+    """
+    Read username & password from Streamlit secrets or environment variables.
+    You must define AUTH_USER and AUTH_PASSWORD in .streamlit/secrets.toml
+    (and/or in your hosting platform).
+    """
+    user = st.secrets.get("AUTH_USER", os.environ.get("AUTH_USER"))
+    pwd = st.secrets.get("AUTH_PASSWORD", os.environ.get("AUTH_PASSWORD"))
+    return user, pwd
+
+
+# ----------------------------------------------------
 # UTILIDADES
 # ----------------------------------------------------
 def rerun():
@@ -544,9 +558,7 @@ def crear_pdf_cotizacion(
         story.append(tabla_planes)
         story.append(Spacer(1, 6))
 
-    
-
-        # ------------------ FICHAS TÉCNICAS / IMÁGENES ------------------
+    # ------------------ FICHAS TÉCNICAS / IMÁGENES ------------------
     # Solo se muestran si el usuario sube al menos una imagen.
     # Sin título y sin cuadros/bordes de slots.
     if fichas_tecnicas and len(fichas_tecnicas) > 0:
@@ -583,10 +595,6 @@ def crear_pdf_cotizacion(
         )
         story.append(tabla_fichas)
         story.append(Spacer(1, 8))
-
-    
-    
-
 
     # ------------------ FOOTER (LOGO + BARRA AL FONDO) ------------------
     def add_footer(canvas, doc_):
@@ -637,6 +645,9 @@ def crear_pdf_cotizacion(
 # ----------------------------------------------------
 # SESSION STATE
 # ----------------------------------------------------
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 if "equipos_cotizacion" not in st.session_state:
@@ -657,6 +668,32 @@ if "comentarios" not in st.session_state:
     st.session_state["comentarios"] = ""
 if "fichas_tecnicas" not in st.session_state:
     st.session_state["fichas_tecnicas"] = []
+
+
+# ----------------------------------------------------
+# LOGIN PAGE (protects the whole app)
+# ----------------------------------------------------
+valid_user, valid_pwd = get_auth_credentials()
+
+if not st.session_state["authenticated"]:
+    st.title("🔐 Acceso al cotizador AT&T")
+
+    with st.form("auth_form"):
+        input_user = st.text_input("Usuario")
+        input_pwd = st.text_input("Contraseña", type="password")
+        submit_auth = st.form_submit_button("Ingresar")
+
+    if submit_auth:
+        if valid_user is None or valid_pwd is None:
+            st.error("Credenciales no configuradas en secrets (AUTH_USER / AUTH_PASSWORD).")
+        elif input_user == valid_user and input_pwd == valid_pwd:
+            st.session_state["authenticated"] = True
+            st.success("Acceso correcto.")
+            rerun()
+        else:
+            st.error("Usuario o contraseña incorrectos.")
+
+    st.stop()
 
 
 # ----------------------------------------------------
@@ -842,19 +879,18 @@ else:
     )
 
     st.dataframe(
-    df_mostrar.style.format(
-        {
-            "PRECIO LISTA": "${:,.2f}",
-            "PROMOCIÓN": "${:,.2f}",
-            "AHORRO": "${:,.2f}",
-            "ENGANCHE": "${:,.2f}",
-            "EQUIPO + PLAN": "${:,.2f}",
-            "% ENG": "{:.0f}%",
-        }
-    ),
-    width="stretch",
-)
-
+        df_mostrar.style.format(
+            {
+                "PRECIO LISTA": "${:,.2f}",
+                "PROMOCIÓN": "${:,.2f}",
+                "AHORRO": "${:,.2f}",
+                "ENGANCHE": "${:,.2f}",
+                "EQUIPO + PLAN": "${:,.2f}",
+                "% ENG": "{:.0f}%",
+            }
+        ),
+        width="stretch",
+    )
 
     col_b1, col_b2, col_b3 = st.columns(3)
     with col_b1:
