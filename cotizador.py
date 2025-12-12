@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, date
 import random
 import string
 import re
+import uuid  # 👈 NUEVO: para generar sufijos únicos
 
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import (
@@ -178,9 +179,16 @@ def get_plan_options(excel_bytes: bytes):
 
 
 def generar_folio(fecha: datetime) -> str:
-    base = fecha.strftime("%y%m%d")
-    sufijo = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
-    return f"{base}-{sufijo}"
+    """
+    Genera un folio prácticamente único combinando la fecha y un sufijo basado en UUID.
+
+    Formato: yymmdd-XXXXXX
+    - yymmdd -> fecha (año, mes, día)
+    - XXXXXX -> primeros 6 caracteres de un UUID v4 en hex, en mayúsculas
+    """
+    base = fecha.strftime("%y%m%d")          # ej. 251212
+    unique = uuid.uuid4().hex[:6].upper()    # ej. 'A3F9BC'
+    return f"{base}-{unique}"                # ej. '251212-A3F9BC'
 
 
 # ----------------------------------------------------
