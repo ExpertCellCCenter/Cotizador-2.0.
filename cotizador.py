@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, date
 import random
 import string
 import re
-import uuid  
+import uuid  # Para sufijo único en folios
 
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import (
@@ -99,24 +99,31 @@ def parse_vigencia_cell(raw) -> date:
 @st.cache_data
 def get_equipos_df(excel_bytes: bytes) -> pd.DataFrame:
     """
-    Lee la hoja 'AT&T Premium' y regresa:
+    Lee la hoja 'AT&T Premium' y regresa un DataFrame con:
       - Nombre Completo
-      - PrecioLista (numérico)
+      - PrecioLista (numérico, a partir de 'Precio de Contado')
       - VigenciaHasta (date)
+      - Todas las columnas de promociones de meses: '24 Meses', '24 Meses2', etc.
     """
     xio = BytesIO(excel_bytes)
     df = pd.read_excel(xio, sheet_name="AT&T Premium", header=4)
 
     base_cols = ["Nombre Completo", "Precio de Contado"]
-    df = df[base_cols + [c for c in df.columns if c not in base_cols]].copy()
+    promo_cols = [c for c in df.columns if "Meses" in str(c)]
+
+    # Nos quedamos con nombre, precio contado, columnas de meses,
+    # y luego cualquier columna extra (VIGENCIA, COMENTARIOS, etc.).
+    df = df[base_cols + promo_cols + [c for c in df.columns if c not in base_cols + promo_cols]].copy()
 
     df["Nombre Completo"] = df["Nombre Completo"].astype(str).str.strip()
 
+    # Precio de contado → numérico limpio
     price = df["Precio de Contado"]
     price_str = price.astype(str).str.replace(r"[^\d,.-]", "", regex=True)
     price_str = price_str.str.replace(",", "", regex=False)
     df["PrecioLista"] = pd.to_numeric(price_str, errors="coerce")
 
+    # Vigencia
     vig_cols = [c for c in df.columns if "vigencia" in str(c).lower()]
     if vig_cols:
         df["VigenciaTexto"] = df[vig_cols[0]]
@@ -128,7 +135,9 @@ def get_equipos_df(excel_bytes: bytes) -> pd.DataFrame:
     df = df.dropna(subset=["Nombre Completo", "PrecioLista"])
     df = df[df["Nombre Completo"].str.len() > 0]
 
-    return df[["Nombre Completo", "PrecioLista", "VigenciaHasta"]]
+    cols_return = ["Nombre Completo", "PrecioLista", "VigenciaHasta"] + promo_cols
+    cols_return = [c for c in cols_return if c in df.columns]
+    return df[cols_return]
 
 
 @st.cache_data
@@ -138,11 +147,20 @@ def get_plan_options(excel_bytes: bytes):
 
       - Fila 3 (index 2): nombres → 'Azul 1 (5GB)', etc.
       - Fila 4 (index 3): precios → 319, 419, 1259, etc.
-    """
-    df = pd.read_excel(BytesIO(excel_bytes), sheet_name="AT&T Premium", header=None)
 
-    names_row = df.iloc[2]
-    price_row = df.iloc[3]
+    Para cada plan se calcula un 'suffix' que mapea a las columnas de promo:
+      Azul 1  -> suffix ''   -> 24 Meses, 30 Meses, 36 Meses
+      Azul 2  -> suffix '2'  -> 24 Meses2, 30 Meses2, ...
+      ...
+      Diamante -> suffix '8' -> 24 Meses8, 30 Meses8, 36 Meses8
+    """
+    df0 = pd.read_excel(BytesIO(excel_bytes), sheet_name="AT&T Premium", header=None)
+
+    names_row = df0.iloc[2]
+    price_row = df0.iloc[3]
+
+    plan_suffixes = ["", "2", "3", "4", "5", "6", "7", "8"]
+    plan_idx = -1
 
     options = []
     for name, price in zip(names_row, price_row):
@@ -166,16 +184,37 @@ def get_plan_options(excel_bytes: bytes):
         if m:
             gb = m.group(1).strip()
 
-        options.append(dict(plan=label, costo=p, gb=gb))
+        plan_idx += 1
+        suffix = plan_suffixes[plan_idx] if plan_idx < len(plan_suffixes) else ""
 
-    seen = set()
-    unique = []
-    for opt in options:
-        if opt["plan"] not in seen:
-            seen.add(opt["plan"])
-            unique.append(opt)
+        options.append(dict(plan=label, costo=p, gb=gb, suffix=suffix))
 
-    return unique
+    return options
+
+
+def obtener_precio_promocional_equipo(row_equipo: pd.Series, plazo: int, plan_suffix: str) -> float:
+    """
+    Dado un equipo (fila del DataFrame), el plazo y el suffix del plan,
+    devuelve el precio promocional de equipo:
+
+    - Si plazo ∈ {24, 30, 36} y existe columna '24 Meses{suffix}' etc con un valor numérico
+      (incluyendo 0.0) → usa ese valor (puede ser gratis).
+    - Si no existe columna o el valor no es numérico → usa PrecioLista (precio de contado).
+    """
+    if plazo in (24, 30, 36):
+        base = f"{plazo} Meses"
+        col_name = base + (plan_suffix if plan_suffix else "")
+        if col_name in row_equipo.index:
+            val = row_equipo[col_name]
+            try:
+                val_f = float(val)
+                if not pd.isna(val_f):
+                    return val_f
+            except (TypeError, ValueError):
+                pass
+
+    # Sin promo válida → usar precio de contado
+    return float(row_equipo["PrecioLista"])
 
 
 def generar_folio(fecha: datetime) -> str:
@@ -320,7 +359,6 @@ def crear_pdf_cotizacion(
         left_header.append(logo_flowable)
     left_header.append(Paragraph("Distribuidor Autorizado", styles["HeaderSmall"]))
 
-    # Estas proporciones se escalan al ancho
     header_widths = scale_widths([70, 50, 50])
     left_table = Table(
         [left_header],
@@ -334,7 +372,6 @@ def crear_pdf_cotizacion(
         )
     )
 
-    # Datos del cliente en el centro
     cliente_label = "<b>CLIENTE</b>"
     cliente_nombre = cliente or "—"
     tel_str = cliente_tel or "—"
@@ -408,7 +445,6 @@ def crear_pdf_cotizacion(
     )
     aviso_para = Paragraph(aviso_texto, styles["Normal"])
 
-    # Una sola caja para DISTRIBUIDOR AUTORIZADO
     cards_widths = scale_widths([84, 86])
     card_right_table = Table(
         [
@@ -494,7 +530,6 @@ def crear_pdf_cotizacion(
             ]
         )
 
-    # Anchos base en mm escalados al ancho útil (se estira hasta los márgenes)
     col_widths_equipos = scale_widths(
         [53, 20, 20, 17, 12, 12, 18, 15, 17]
     )
@@ -567,8 +602,6 @@ def crear_pdf_cotizacion(
         story.append(Spacer(1, 6))
 
     # ------------------ FICHAS TÉCNICAS / IMÁGENES ------------------
-    # Solo se muestran si el usuario sube al menos una imagen.
-    # Sin título y sin cuadros/bordes de slots.
     if fichas_tecnicas and len(fichas_tecnicas) > 0:
         max_slots = min(3, len(fichas_tecnicas))  # 1, 2 o 3 imágenes reales
         slot_widths = [doc.width / max_slots] * max_slots
@@ -579,7 +612,6 @@ def crear_pdf_cotizacion(
             img_bytes = fichas_tecnicas[i]
             img_stream = BytesIO(img_bytes)
             img = Image(img_stream)
-            # Limitar tamaño para que no se salgan del renglón
             img._restrictSize(slot_widths[i], slot_height)
             cells.append(img)
 
@@ -591,7 +623,6 @@ def crear_pdf_cotizacion(
         tabla_fichas.setStyle(
             TableStyle(
                 [
-                    # SIN GRID → sin recuadros ni líneas
                     ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                     ("ALIGN", (0, 0), (-1, -1), "CENTER"),
                     ("TOPPADDING", (0, 0), (-1, -1), 0),
@@ -781,6 +812,7 @@ with col_izq:
         plan_sel = selected_plan["plan"]
         plan_costo = float(selected_plan["costo"])
         plan_gb = selected_plan["gb"]
+        plan_suffix = selected_plan.get("suffix", "")
     else:
         st.warning(
             "No se encontraron planes en el archivo. Se usará un plan sin costo."
@@ -788,6 +820,7 @@ with col_izq:
         plan_sel = "Plan sin costo"
         plan_costo = 0.0
         plan_gb = ""
+        plan_suffix = ""
 
     plazo = st.selectbox("Plazo (meses):", [12, 18, 24, 30, 36], index=2)
 
@@ -795,9 +828,10 @@ with col_izq:
         "% de enganche:", min_value=0.0, max_value=100.0, value=0.0, step=5.0
     )
 
-    promo = precio_lista
-
+    # 👉 AQUÍ se usa SIEMPRE el precio promocional real del Excel
     if st.button("Ingresar", type="primary"):
+        promo = obtener_precio_promocional_equipo(precio_row, plazo, plan_suffix)
+
         ahorro = max(precio_lista - promo, 0.0)
         enganche_mxn = promo * (porc_eng / 100.0)
         if plazo > 0:
@@ -820,6 +854,7 @@ with col_izq:
                 plan_costo=float(plan_costo),
                 plan_gb=plan_gb,
                 vigencia_hasta=vigencia_hasta_equipo,
+                plan_suffix=plan_suffix,
             )
         )
         st.success("Equipo agregado a la cotización.")
@@ -946,13 +981,10 @@ if len(st.session_state["equipos_cotizacion"]) > 0:
     else:
         vigencia_global = last_day_of_month(today)
 
-    # Días reales restantes (inclusive)
     dias_restantes = max(1, (vigencia_global - today).days + 1)
 
-    # Regla de negocio: la cotización no puede exceder 7 días
     dias_validez_pdf = min(dias_restantes, 7)
 
-    # Fecha efectiva de vigencia (no excede ni la vigencia global ni los 7 días)
     vigencia_efectiva = today + timedelta(days=dias_validez_pdf - 1)
 
     st.session_state["dias_validez"] = dias_validez_pdf
@@ -1009,4 +1041,3 @@ else:
         file_name="cotizacion_att.pdf",
         mime="application/pdf",
     )
-
