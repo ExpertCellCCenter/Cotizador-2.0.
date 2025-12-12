@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, date
 import random
 import string
 import re
-import uuid  # 👈 NUEVO: para generar sufijos únicos
+import uuid  
 
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import (
@@ -1009,3 +1009,4 @@ else:
         file_name="cotizacion_att.pdf",
         mime="application/pdf",
     )
+
