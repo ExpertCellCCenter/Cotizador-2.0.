@@ -23,7 +23,7 @@ from reportlab.platypus import (
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import mm
-from reportlab.lib.utils import ImageReader  # ✅ NUEVO (para que las imágenes se rendericen bien)
+from reportlab.lib.utils import ImageReader  # (queda, aunque ya no se usa)
 
 # ----------------------------------------------------
 # CONFIG STREAMLIT
@@ -569,9 +569,7 @@ def crear_pdf_cotizacion(
             ]
         )
 
-    col_widths_equipos = scale_widths(
-        [53, 20, 20, 17, 12, 12, 18, 15, 17]
-    )
+    col_widths_equipos = scale_widths([53, 20, 20, 17, 12, 12, 18, 15, 17])
 
     tabla_equipos = Table(
         data_equipos,
@@ -656,7 +654,8 @@ def crear_pdf_cotizacion(
             img_stream.seek(0)
             _img_stream_refs.append(img_stream)
 
-            img = Image(ImageReader(img_stream))
+            # ✅ FIX: Image() debe recibir BytesIO, NO ImageReader
+            img = Image(img_stream)
             img._restrictSize(slot_widths[i], slot_height)
             cells.append(img)
 
