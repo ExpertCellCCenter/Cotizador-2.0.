@@ -104,6 +104,9 @@ def get_equipos_df(excel_bytes: bytes) -> pd.DataFrame:
       - PrecioLista (numérico, a partir de 'Precio de Contado')
       - VigenciaHasta (date)
       - Todas las columnas de promociones de meses: '24 Meses', '24 Meses2', etc.
+    Además:
+      - Filtra solo equipos vigentes (VigenciaHasta >= hoy)
+      - Filtra solo equipos con promoción real (algún Meses != PrecioLista con tolerancia)
     """
     xio = BytesIO(excel_bytes)
     df = pd.read_excel(xio, sheet_name="AT&T Premium", header=4)
@@ -134,6 +137,17 @@ def get_equipos_df(excel_bytes: bytes) -> pd.DataFrame:
 
     df = df.dropna(subset=["Nombre Completo", "PrecioLista"])
     df = df[df["Nombre Completo"].str.len() > 0]
+
+    # ✅ SOLO VIGENTES
+    today = date.today()
+    df = df[df["VigenciaHasta"] >= today]
+
+    # ✅ SOLO CON PROMOCIÓN REAL
+    if promo_cols:
+        promo_num = df[promo_cols].apply(pd.to_numeric, errors="coerce")
+        diff = promo_num.sub(df["PrecioLista"], axis=0).abs()
+        has_real_promo = diff.gt(0.01).any(axis=1)  # > 1 centavo
+        df = df[has_real_promo]
 
     cols_return = ["Nombre Completo", "PrecioLista", "VigenciaHasta"] + promo_cols
     cols_return = [c for c in cols_return if c in df.columns]
@@ -493,7 +507,7 @@ def crear_pdf_cotizacion(
     if comentarios and comentarios.strip():
         comentarios_html = comentarios.replace("\n", "<br/>")
     else:
-        comentarios_html = "pendiente validación"
+        comentarios_html = ""
     story.append(Paragraph(comentarios_html, styles["Normal"]))
     story.append(Spacer(1, 8))
 
@@ -776,6 +790,12 @@ st.title(
 excel_bytes = st.session_state["excel_bytes"]
 
 df_equipos_vista = get_equipos_df(excel_bytes)
+
+# ✅ Si no hay equipos vigentes con promo, detener
+if df_equipos_vista.empty:
+    st.error("No hay equipos vigentes con promoción en el archivo cargado.")
+    st.stop()
+
 lista_equipos = sorted(df_equipos_vista["Nombre Completo"].unique().tolist())
 plan_options = get_plan_options(excel_bytes)
 
@@ -822,7 +842,22 @@ with col_izq:
         plan_gb = ""
         plan_suffix = ""
 
-    plazo = st.selectbox("Plazo (meses):", [24, 30, 36], index=2)
+    # ✅ Plazos disponibles SOLO desde el Excel (según columnas "XX Meses{suffix}")
+    plan_promo_cols = [
+        c for c in df_equipos_vista.columns
+        if re.match(rf"^(\d+)\s*Meses{re.escape(plan_suffix)}$", str(c))
+    ]
+    plazos_disponibles = sorted({int(re.match(r"^(\d+)\s*Meses", str(c)).group(1)) for c in plan_promo_cols})
+
+    # Fallback: si por alguna razón no encuentra por suffix, usa todos los "Meses" del archivo
+    if not plazos_disponibles:
+        all_promo_cols = [c for c in df_equipos_vista.columns if "Meses" in str(c)]
+        plazos_disponibles = sorted({int(re.match(r"^(\d+)\s*Meses", str(c)).group(1)) for c in all_promo_cols})
+
+    # Default: 24 si existe
+    default_idx = plazos_disponibles.index(24) if 24 in plazos_disponibles else 0
+
+    plazo = st.selectbox("Plazo (meses):", plazos_disponibles, index=default_idx)
 
     porc_eng = st.number_input(
         "% de enganche:", min_value=0.0, max_value=100.0, value=0.0, step=5.0
@@ -1041,4 +1076,3 @@ else:
         file_name="cotizacion_att.pdf",
         mime="application/pdf",
     )
-
