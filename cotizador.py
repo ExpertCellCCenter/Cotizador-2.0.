@@ -23,6 +23,7 @@ from reportlab.platypus import (
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader  # ✅ NUEVO (para que las imágenes se rendericen bien)
 
 # ----------------------------------------------------
 # CONFIG STREAMLIT
@@ -645,11 +646,17 @@ def crear_pdf_cotizacion(
         slot_widths = [doc.width / max_slots] * max_slots
         slot_height = 45 * mm
 
+        # ✅ Mantener referencias vivas hasta que termine doc.build()
+        _img_stream_refs = []
+
         cells = []
         for i in range(max_slots):
             img_bytes = fichas_tecnicas[i]
             img_stream = BytesIO(img_bytes)
-            img = Image(img_stream)
+            img_stream.seek(0)
+            _img_stream_refs.append(img_stream)
+
+            img = Image(ImageReader(img_stream))
             img._restrictSize(slot_widths[i], slot_height)
             cells.append(img)
 
