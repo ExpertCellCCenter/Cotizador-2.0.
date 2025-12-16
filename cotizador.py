@@ -23,7 +23,6 @@ from reportlab.platypus import (
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import mm
-from reportlab.lib.utils import ImageReader  # (queda, aunque ya no se usa)
 
 # ----------------------------------------------------
 # CONFIG STREAMLIT
@@ -100,109 +99,331 @@ def parse_vigencia_cell(raw) -> date:
     return last_day_of_month(today)
 
 
+def _normalize_key(s: str) -> str:
+    """
+    Normaliza nombres para poder hacer match entre:
+      - AT&T Premium (Modelo / Nombre Completo)
+      - Promociones AT&T Premium (Equipo)
+    Deja solo A-Z0-9 en MAYÚSCULAS y sin acentos.
+    """
+    s = "" if s is None else str(s)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.upper()
+    s = re.sub(r"[^A-Z0-9]+", "", s)
+    return s
+
+
+# ----------------------------------------------------
+# MATCH HELPERS (robust Modelo/Escenario)
+# ----------------------------------------------------
+_MATCH_IGNORE = {
+    "ATT", "AT", "T",
+    "AZUL", "NEGRO", "BLANCO", "ROJO", "VERDE", "GRIS", "PLATA", "DORADO", "MORADO", "ROSA", "AMARILLO",
+    "OCEANO", "OCÉANO",
+}
+
+def _tokens_for_match(s: str) -> set:
+    """
+    Tokeniza texto para match robusto entre 'Equipo' (promos) y 'Modelo/Nombre Completo' (base).
+    """
+    s = "" if s is None else str(s)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.upper()
+
+    toks = re.findall(r"[A-Z0-9]+", s)
+    toks = [t for t in toks if t and t not in _MATCH_IGNORE]
+    return set(toks)
+
+
 def pdf_safe_text(x) -> str:
     """
-    Normalize Excel/Unicode text into something ReportLab/Helvetica renders safely.
-    Also escapes XML entities for Paragraph.
+    Normaliza texto para que ReportLab/Helvetica no lo "rompa" (caracteres raros)
+    y escapa entidades XML para Paragraph.
     """
     s = "" if x is None else str(x)
 
-    # Normalize compatibility characters to common forms
     s = unicodedata.normalize("NFKC", s)
 
-    # Replace hyphen variants that may not exist in Helvetica
+    # normaliza guiones raros
     for ch in ["\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2212"]:
         s = s.replace(ch, "-")
 
-    # Remove zero-width / control formatting chars
+    # quita caracteres de control/invisibles
     s = "".join(c for c in s if unicodedata.category(c) not in ("Cf", "Cc"))
 
-    # Escape XML for ReportLab Paragraph
     return escape(s)
 
 
+def _money_to_float(v):
+    """Convierte celdas tipo '$2,379.08' / 'NA' / float a float o NaN."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return float("nan")
+    s = str(v).strip()
+    if not s:
+        return float("nan")
+    if s.strip().upper() == "NA":
+        return float("nan")
+    s = re.sub(r"[^\d,.\-]", "", s)
+    s = s.replace(",", "")
+    return pd.to_numeric(s, errors="coerce")
+
+
+# ----------------------------------------------------
+# EXCEL: PROMOCIONES AT&T PREMIUM
+# ----------------------------------------------------
+@st.cache_data
+def get_promociones_premium_df(excel_bytes: bytes) -> pd.DataFrame:
+    """
+    Lee 'Promociones AT&T Premium' y regresa un DF con:
+      - PromoEquipo, PromoKey
+      - PromoFechaInicio (date o None)
+      - PromoFechaFin (date o None si Indefinido)
+      - Columnas promo: 24/30/36 Meses + suffix ('',2,3,...,8)
+
+    Importante:
+      - "NA" -> NaN (y caerá a base en la lógica de precio).
+      - Se filtran SOLO las filas NO vigentes por fechas.
+    """
+    df0 = pd.read_excel(BytesIO(excel_bytes), sheet_name="Promociones AT&T Premium", header=None)
+
+    data = df0.iloc[8:].copy()
+    data = data[data[5].notna()].copy()
+
+    out = pd.DataFrame()
+    out["PromoEquipo"] = data[5].astype(str).str.strip()
+    out["PromoKey"] = out["PromoEquipo"].apply(_normalize_key)
+
+    def _to_date(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return None
+        if isinstance(x, datetime):
+            return x.date()
+        if isinstance(x, date):
+            return x
+        if isinstance(x, str):
+            t = x.strip().upper()
+            if not t or "INDEFIN" in t:
+                return None
+            try:
+                return pd.to_datetime(x, errors="coerce").date()
+            except Exception:
+                return None
+        try:
+            dt = pd.to_datetime(x, errors="coerce")
+            if pd.isna(dt):
+                return None
+            return dt.date()
+        except Exception:
+            return None
+
+    out["PromoFechaInicio"] = data[31].apply(_to_date)
+    out["PromoFechaFin"] = data[32].apply(_to_date)
+
+    plan_suffixes = ["", "2", "3", "4", "5", "6", "7", "8"]
+    promo_cols = []
+
+    for i, suf in enumerate(plan_suffixes):
+        base_col = 7 + i * 3
+        for j, plazo in enumerate([24, 30, 36]):
+            col_idx = base_col + j
+            col_name = f"{plazo} Meses{suf}"
+            out[col_name] = data[col_idx].apply(_money_to_float)  # NA/$ -> NaN/float
+            promo_cols.append(col_name)
+
+    today = date.today()
+
+    def _is_valid(row):
+        s = row["PromoFechaInicio"]
+        e = row["PromoFechaFin"]
+        if s is not None and today < s:
+            return False
+        if e is not None and today > e:
+            return False
+        return True
+
+    out = out[out.apply(_is_valid, axis=1)].copy()
+
+    keep_cols = ["PromoEquipo", "PromoKey", "PromoFechaInicio", "PromoFechaFin"] + promo_cols
+    return out[keep_cols].reset_index(drop=True)
+
+
+# ----------------------------------------------------
+# EXCEL: AT&T PREMIUM (base/lista) + MERGE con promos
+# ----------------------------------------------------
 @st.cache_data
 def get_equipos_df(excel_bytes: bytes) -> pd.DataFrame:
     """
-    Lee la hoja 'AT&T Premium' y regresa un DataFrame con:
-      - Nombre Completo
-      - PrecioLista (numérico, a partir de 'Precio de Contado')
-      - VigenciaHasta (date)
-      - Todas las columnas de promociones de meses: '24 Meses', '24 Meses2', etc.
-    Además:
-      - Filtra solo equipos vigentes (VigenciaHasta >= hoy)
-      - Filtra solo equipos con promoción real (algún Meses != PrecioLista con tolerancia)
+    Base/lista desde 'AT&T Premium' y merge con 'Promociones AT&T Premium'.
+
+    ✅ Reglas:
+      - Si promo = NA/NaN -> usar el precio BASE del mismo plan/plazo en AT&T Premium.
+      - Si equipo NO aparece en promociones -> usar BASE (AT&T Premium).
+      - Vigencia final:
+          si existe FechaFin promo -> min(FechaFin promo, vigencia base)
+          si no -> vigencia base
+      - Solo mostrar equipos vigentes (hoy <= VigenciaHasta)
     """
-    xio = BytesIO(excel_bytes)
-    df = pd.read_excel(xio, sheet_name="AT&T Premium", header=4)
+    df = pd.read_excel(BytesIO(excel_bytes), sheet_name="AT&T Premium", header=4)
 
-    base_cols = ["Nombre Completo", "Precio de Contado"]
-    promo_cols = [c for c in df.columns if "Meses" in str(c)]
+    # Columna de nombre: algunos archivos usan "Nombre Completo", otros "Modelo"
+    if "Nombre Completo" in df.columns:
+        name_col = "Nombre Completo"
+    elif "Modelo" in df.columns:
+        name_col = "Modelo"
+    else:
+        name_col = df.columns[0]
 
-    # Nos quedamos con nombre, precio contado, columnas de meses,
-    # y luego cualquier columna extra (VIGENCIA, COMENTARIOS, etc.).
-    df = df[base_cols + promo_cols + [c for c in df.columns if c not in base_cols + promo_cols]].copy()
+    base_cols = [name_col, "Precio de Contado"]
+    df = df[base_cols + [c for c in df.columns if c not in base_cols]].copy()
 
-    df["Nombre Completo"] = df["Nombre Completo"].astype(str).str.strip()
+    # Estandarizamos a "Nombre Completo" para el resto del app
+    df["Nombre Completo"] = df[name_col].astype(str).str.strip()
 
-    # Precio de contado → numérico limpio
+    # Asegura columna "Modelo" para match (si no existe, la dejamos vacía)
+    if "Modelo" in df.columns:
+        df["Modelo"] = df["Modelo"].astype(str).str.strip()
+    else:
+        df["Modelo"] = ""
+
+    # Precio de contado -> numérico limpio
     price = df["Precio de Contado"]
     price_str = price.astype(str).str.replace(r"[^\d,.-]", "", regex=True)
     price_str = price_str.str.replace(",", "", regex=False)
     df["PrecioLista"] = pd.to_numeric(price_str, errors="coerce")
 
-    # Vigencia
+    # Vigencia base
     vig_cols = [c for c in df.columns if "vigencia" in str(c).lower()]
     if vig_cols:
         df["VigenciaTexto"] = df[vig_cols[0]]
     else:
         df["VigenciaTexto"] = "INDEFINIDO"
 
-    df["VigenciaHasta"] = df["VigenciaTexto"].apply(parse_vigencia_cell)
+    df["VigenciaHastaBase"] = df["VigenciaTexto"].apply(parse_vigencia_cell)
 
     df = df.dropna(subset=["Nombre Completo", "PrecioLista"])
-    df = df[df["Nombre Completo"].str.len() > 0]
+    df = df[df["Nombre Completo"].str.len() > 0].copy()
 
-    # ✅ SOLO VIGENTES
+    # ✅ Guardar precios BASE por plan/plazo (de AT&T Premium) como Base_...
+    base_promo_cols = [c for c in df.columns if re.match(r"^\s*\d+\s*Meses\d*\s*$", str(c))]
+    for c in base_promo_cols:
+        df[f"Base_{str(c).strip()}"] = df[c].apply(_money_to_float)
+
+    # ✅ IMPORTANTÍSIMO: eliminar columnas "Meses" originales antes del merge
+    df = df.drop(columns=base_promo_cols, errors="ignore")
+
+    # Promos vigentes
+    promos = get_promociones_premium_df(excel_bytes)
+
+    # Si no hay promos, regresamos base
+    if promos.empty:
+        out = df.copy()
+        out["VigenciaHasta"] = out["VigenciaHastaBase"]
+        today = date.today()
+        out = out[out["VigenciaHasta"] >= today].copy()
+
+        base_keep = [f"Base_{str(c).strip()}" for c in base_promo_cols]
+        base_keep = [c for c in base_keep if c in out.columns]
+        return out[["Nombre Completo", "PrecioLista", "VigenciaHasta"] + base_keep]
+
+    # ✅ Keys de match: usar Modelo + Nombre Completo + fallback por tokens
+    df["BaseKeyFull"] = df["Nombre Completo"].apply(_normalize_key)
+    df["BaseKeyModel"] = df["Modelo"].apply(_normalize_key)
+
+    promo_keys = promos["PromoKey"].tolist()
+    promo_order = sorted(range(len(promo_keys)), key=lambda i: len(promo_keys[i]), reverse=True)
+    promo_tokens = [_tokens_for_match(x) for x in promos["PromoEquipo"].astype(str).tolist()]
+
+    def _find_promo_idx(full_key: str, model_key: str, full_name: str, model_name: str):
+        full_key = full_key or ""
+        model_key = model_key or ""
+
+        # 1) Match fuerte: promo_key dentro de Modelo o Nombre Completo
+        for i in promo_order:
+            pk = promo_keys[i]
+            if pk and (pk in model_key or pk in full_key):
+                return i
+
+        # 2) Fallback por tokens
+        base_tokens = _tokens_for_match(model_name) | _tokens_for_match(full_name)
+
+        best_i = None
+        best_score = 0
+
+        for i in promo_order:
+            inter = base_tokens & promo_tokens[i]
+            if not inter:
+                continue
+
+            if len(inter) >= 2:
+                score = sum(len(t) for t in inter)
+            else:
+                longest = max((len(t) for t in inter), default=0)
+                if longest < 8:
+                    continue
+                score = longest
+
+            if score > best_score:
+                best_score = score
+                best_i = i
+
+        return best_i
+
+    df["_promo_i"] = df.apply(
+        lambda r: _find_promo_idx(
+            r["BaseKeyFull"],
+            r["BaseKeyModel"],
+            r["Nombre Completo"],
+            r["Modelo"],
+        ),
+        axis=1,
+    )
+
+    promos2 = promos.reset_index().rename(columns={"index": "_promo_i"})
+    df = df.merge(promos2, on="_promo_i", how="left")
+
+    def _vigencia_final(row):
+        pf = row.get("PromoFechaFin", None)
+        vb = row.get("VigenciaHastaBase", None)
+        if isinstance(pf, date):
+            if isinstance(vb, date):
+                return min(pf, vb)
+            return pf
+        if isinstance(vb, date):
+            return vb
+        return last_day_of_month(date.today())
+
+    df["VigenciaHasta"] = df.apply(_vigencia_final, axis=1)
+
+    # Solo vigentes
     today = date.today()
-    df = df[df["VigenciaHasta"] >= today]
+    df = df[df["VigenciaHasta"] >= today].copy()
 
-    # ✅ SOLO CON PROMOCIÓN REAL
-    if promo_cols:
-        promo_num = df[promo_cols].apply(pd.to_numeric, errors="coerce")
-        diff = promo_num.sub(df["PrecioLista"], axis=0).abs()
-        has_real_promo = diff.gt(0.01).any(axis=1)  # > 1 centavo
-        df = df[has_real_promo]
+    promo_cols = [c for c in promos.columns if "Meses" in str(c)]
+    base_keep = [f"Base_{str(c).strip()}" for c in base_promo_cols]
+    base_keep = [c for c in base_keep if c in df.columns]
 
-    cols_return = ["Nombre Completo", "PrecioLista", "VigenciaHasta"] + promo_cols
+    cols_return = ["Nombre Completo", "PrecioLista", "VigenciaHasta"] + promo_cols + base_keep
     cols_return = [c for c in cols_return if c in df.columns]
     return df[cols_return]
 
 
+# ----------------------------------------------------
+# PLAN OPTIONS (desde hoja Promociones AT&T Premium)
+# ----------------------------------------------------
 @st.cache_data
 def get_plan_options(excel_bytes: bytes):
-    """
-    Extrae los planes de renta desde la hoja 'AT&T Premium':
-
-      - Fila 3 (index 2): nombres → 'Azul 1 (5GB)', etc.
-      - Fila 4 (index 3): precios → 319, 419, 1259, etc.
-
-    Para cada plan se calcula un 'suffix' que mapea a las columnas de promo:
-      Azul 1  -> suffix ''   -> 24 Meses, 30 Meses, 36 Meses
-      Azul 2  -> suffix '2'  -> 24 Meses2, 30 Meses2, ...
-      ...
-      Diamante -> suffix '8' -> 24 Meses8, 30 Meses8, 36 Meses8
-    """
-    df0 = pd.read_excel(BytesIO(excel_bytes), sheet_name="AT&T Premium", header=None)
-
-    names_row = df0.iloc[2]
-    price_row = df0.iloc[3]
+    df0 = pd.read_excel(BytesIO(excel_bytes), sheet_name="Promociones AT&T Premium", header=None)
 
     plan_suffixes = ["", "2", "3", "4", "5", "6", "7", "8"]
-    plan_idx = -1
 
     options = []
-    for name, price in zip(names_row, price_row):
+    for i, suffix in enumerate(plan_suffixes):
+        col = 7 + i * 3
+        name = df0.iloc[5, col]
+        price = df0.iloc[6, col]
+
         if pd.isna(name) or pd.isna(price):
             continue
 
@@ -215,16 +436,10 @@ def get_plan_options(excel_bytes: bytes):
         except (TypeError, ValueError):
             continue
 
-        if p < 10 or p > 5000:
-            continue
-
         gb = ""
         m = re.search(r"\(([^)]*)\)", label)
         if m:
             gb = m.group(1).strip()
-
-        plan_idx += 1
-        suffix = plan_suffixes[plan_idx] if plan_idx < len(plan_suffixes) else ""
 
         options.append(dict(plan=label, costo=p, gb=gb, suffix=suffix))
 
@@ -233,40 +448,41 @@ def get_plan_options(excel_bytes: bytes):
 
 def obtener_precio_promocional_equipo(row_equipo: pd.Series, plazo: int, plan_suffix: str) -> float:
     """
-    Dado un equipo (fila del DataFrame), el plazo y el suffix del plan,
-    devuelve el precio promocional de equipo:
-
-    - Si plazo ∈ {24, 30, 36} y existe columna '24 Meses{suffix}' etc con un valor numérico
-      (incluyendo 0.0) → usa ese valor (puede ser gratis).
-    - Si no existe columna o el valor no es numérico → usa PrecioLista (precio de contado).
+    ✅ Nueva regla pedida:
+    - Si hay promo numérica -> usar promo.
+    - Si promo es NA/NaN o no existe -> usar BASE del mismo plan/plazo en AT&T Premium (Base_...).
+    - Si tampoco hay base -> usar PrecioLista.
     """
-    if plazo in (24, 30, 36):
-        base = f"{plazo} Meses"
-        col_name = base + (plan_suffix if plan_suffix else "")
-        if col_name in row_equipo.index:
-            val = row_equipo[col_name]
-            try:
-                val_f = float(val)
-                if not pd.isna(val_f):
-                    return val_f
-            except (TypeError, ValueError):
-                pass
+    base = f"{plazo} Meses"
+    col_promo = base + (plan_suffix if plan_suffix else "")
+    col_base = f"Base_{col_promo}"
 
-    # Sin promo válida → usar precio de contado
+    # 1) promo real
+    if col_promo in row_equipo.index:
+        try:
+            v = float(row_equipo[col_promo])
+            if not pd.isna(v):
+                return v
+        except (TypeError, ValueError):
+            pass
+
+    # 2) base por plan/plazo (AT&T Premium)
+    if col_base in row_equipo.index:
+        try:
+            v = float(row_equipo[col_base])
+            if not pd.isna(v):
+                return v
+        except (TypeError, ValueError):
+            pass
+
+    # 3) contado/lista
     return float(row_equipo["PrecioLista"])
 
 
 def generar_folio(fecha: datetime) -> str:
-    """
-    Genera un folio prácticamente único combinando la fecha y un sufijo basado en UUID.
-
-    Formato: yymmdd-XXXXXX
-    - yymmdd -> fecha (año, mes, día)
-    - XXXXXX -> primeros 6 caracteres de un UUID v4 en hex, en mayúsculas
-    """
-    base = fecha.strftime("%y%m%d")          # ej. 251212
-    unique = uuid.uuid4().hex[:6].upper()    # ej. 'A3F9BC'
-    return f"{base}-{unique}"                # ej. '251212-A3F9BC'
+    base = fecha.strftime("%y%m%d")
+    unique = uuid.uuid4().hex[:6].upper()
+    return f"{base}-{unique}"
 
 
 # ----------------------------------------------------
@@ -286,15 +502,11 @@ def crear_pdf_cotizacion(
     comentarios,
     fichas_tecnicas=None,
 ) -> bytes:
-    """
-    Crea un PDF en memoria con formato muy similar al original de AT&T.
-    """
     if fichas_tecnicas is None:
         fichas_tecnicas = []
 
     buffer = BytesIO()
 
-    # Márgenes MUY pequeños
     doc = SimpleDocTemplate(
         buffer,
         pagesize=letter,
@@ -304,7 +516,6 @@ def crear_pdf_cotizacion(
         bottomMargin=15 * mm,
     )
 
-    # Helper para escalar anchos (en mm) al ancho útil del documento
     def scale_widths(base_mm_list):
         total_points = sum(w * mm for w in base_mm_list)
         if total_points == 0:
@@ -373,7 +584,6 @@ def crear_pdf_cotizacion(
     valido_hasta_text = valido_hasta_str or "—"
     folio = generar_folio(hoy)
 
-    # ------------------ BARRA CIAN SUPERIOR ------------------
     top_bar = Table([[""]], colWidths=[doc.width])
     top_bar.setStyle(
         TableStyle(
@@ -387,7 +597,6 @@ def crear_pdf_cotizacion(
     story.append(top_bar)
     story.append(Spacer(1, 4))
 
-    # ------------------ ENCABEZADO (LOGO + CLIENTE + FOLIO) ------------------
     logo_path = "att_logo.png"
     logo_flowable = None
     if os.path.exists(logo_path):
@@ -403,13 +612,7 @@ def crear_pdf_cotizacion(
         [left_header],
         colWidths=[header_widths[0] * 0.45, header_widths[0] * 0.55],
     )
-    left_table.setStyle(
-        TableStyle(
-            [
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ]
-        )
-    )
+    left_table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
 
     cliente_label = "<b>CLIENTE</b>"
     cliente_nombre = cliente or "—"
@@ -433,38 +636,18 @@ def crear_pdf_cotizacion(
     )
     right_para = Paragraph(header_right_text, styles["HeaderRight"])
 
-    header_table = Table(
-        [[left_table, center_para, right_para]],
-        colWidths=header_widths,
-    )
-    header_table.setStyle(
-        TableStyle(
-            [
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ]
-        )
-    )
+    header_table = Table([[left_table, center_para, right_para]], colWidths=header_widths)
+    header_table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
     story.append(header_table)
 
-    # Línea gris
     line_table = Table([[""]], colWidths=[doc.width])
-    line_table.setStyle(
-        TableStyle(
-            [
-                ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
-            ]
-        )
-    )
+    line_table.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC"))]))
     story.append(line_table)
     story.append(Spacer(1, 6))
 
-    # ------------------ VÁLIDO HASTA ------------------
-    story.append(
-        Paragraph(f"Válido hasta: <b>{valido_hasta_text}</b>", styles["Normal"])
-    )
+    story.append(Paragraph(f"Válido hasta: <b>{valido_hasta_text}</b>", styles["Normal"]))
     story.append(Spacer(1, 4))
 
-    # ------------------ TARJETAS CENTRALES ------------------
     card_left = Paragraph(
         (
             "<b>Esta cotización tiene validez de:</b><br/><br/>"
@@ -486,10 +669,7 @@ def crear_pdf_cotizacion(
 
     cards_widths = scale_widths([84, 86])
     card_right_table = Table(
-        [
-            [Paragraph("DISTRIBUIDOR AUTORIZADO AT&amp;T", styles["BlueTitle"])],
-            [aviso_para],
-        ],
+        [[Paragraph("DISTRIBUIDOR AUTORIZADO AT&amp;T", styles["BlueTitle"])], [aviso_para]],
         colWidths=[cards_widths[1]],
     )
     card_right_table.setStyle(
@@ -508,10 +688,7 @@ def crear_pdf_cotizacion(
         )
     )
 
-    cards = Table(
-        [[card_left, card_right_table]],
-        colWidths=cards_widths,
-    )
+    cards = Table([[card_left, card_right_table]], colWidths=cards_widths)
     cards.setStyle(
         TableStyle(
             [
@@ -529,26 +706,17 @@ def crear_pdf_cotizacion(
 
     # ------------------ COMENTARIOS ------------------
     story.append(Paragraph("<b>Comentarios adicionales</b>", styles["HeaderBig"]))
-    if comentarios and comentarios.strip():
-        comentarios_html = comentarios.replace("\n", "<br/>")
-    else:
-        comentarios_html = "pendiente validación"
-    story.append(Paragraph(comentarios_html, styles["Normal"]))
+
+    if comentarios and str(comentarios).strip():
+        comentarios_html = pdf_safe_text(comentarios).replace("\n", "<br/>")
+        story.append(Paragraph(comentarios_html, styles["Normal"]))
+
     story.append(Spacer(1, 8))
 
-    # ------------------ RESUMEN DE EQUIPOS ------------------
     story.append(Paragraph("<b>Resumen de equipos</b>", styles["HeaderBig"]))
 
     columnas_equipos = [
-        "EQUIPO",
-        "PRECIO LISTA",
-        "PROMOCIÓN",
-        "AHORRO",
-        "PLAZO",
-        "% ENG",
-        "ENGANCHE",
-        "PLAN",
-        "EQUIPO + PLAN",
+        "EQUIPO", "PRECIO LISTA", "PROMOCIÓN", "AHORRO", "PLAZO", "% ENG", "ENGANCHE", "PLAN", "EQUIPO + PLAN"
     ]
 
     header_row = [Paragraph(col, styles["HeaderSmall"]) for col in columnas_equipos]
@@ -571,11 +739,7 @@ def crear_pdf_cotizacion(
 
     col_widths_equipos = scale_widths([53, 20, 20, 17, 12, 12, 18, 15, 17])
 
-    tabla_equipos = Table(
-        data_equipos,
-        colWidths=col_widths_equipos,
-        repeatRows=1,
-    )
+    tabla_equipos = Table(data_equipos, colWidths=col_widths_equipos, repeatRows=1)
     tabla_equipos.setStyle(
         TableStyle(
             [
@@ -596,7 +760,6 @@ def crear_pdf_cotizacion(
     story.append(tabla_equipos)
     story.append(Spacer(1, 8))
 
-    # ------------------ PLANES INCLUIDOS ------------------
     if len(planes_incluidos) > 0:
         story.append(Paragraph("<b>Planes incluidos</b>", styles["HeaderBig"]))
 
@@ -616,10 +779,7 @@ def crear_pdf_cotizacion(
 
         col_widths_planes = scale_widths([80, 45, 45])
 
-        tabla_planes = Table(
-            data_planes,
-            colWidths=col_widths_planes,
-        )
+        tabla_planes = Table(data_planes, colWidths=col_widths_planes)
         tabla_planes.setStyle(
             TableStyle(
                 [
@@ -638,15 +798,12 @@ def crear_pdf_cotizacion(
         story.append(tabla_planes)
         story.append(Spacer(1, 6))
 
-    # ------------------ FICHAS TÉCNICAS / IMÁGENES ------------------
     if fichas_tecnicas and len(fichas_tecnicas) > 0:
-        max_slots = min(3, len(fichas_tecnicas))  # 1, 2 o 3 imágenes reales
+        max_slots = min(3, len(fichas_tecnicas))
         slot_widths = [doc.width / max_slots] * max_slots
         slot_height = 45 * mm
 
-        # ✅ Mantener referencias vivas hasta que termine doc.build()
         _img_stream_refs = []
-
         cells = []
         for i in range(max_slots):
             img_bytes = fichas_tecnicas[i]
@@ -654,16 +811,11 @@ def crear_pdf_cotizacion(
             img_stream.seek(0)
             _img_stream_refs.append(img_stream)
 
-            # ✅ FIX: Image() debe recibir BytesIO, NO ImageReader
             img = Image(img_stream)
             img._restrictSize(slot_widths[i], slot_height)
             cells.append(img)
 
-        tabla_fichas = Table(
-            [cells],
-            colWidths=slot_widths,
-            rowHeights=[slot_height],
-        )
+        tabla_fichas = Table([cells], colWidths=slot_widths, rowHeights=[slot_height])
         tabla_fichas.setStyle(
             TableStyle(
                 [
@@ -679,7 +831,6 @@ def crear_pdf_cotizacion(
         story.append(tabla_fichas)
         story.append(Spacer(1, 8))
 
-    # ------------------ FOOTER (LOGO + BARRA AL FONDO) ------------------
     def add_footer(canvas, doc_):
         canvas.saveState()
         page_width, page_height = letter
@@ -796,9 +947,7 @@ if not st.session_state["logged_in"]:
 
     if submitted:
         if not ejecutivo or not attuid or not archivo:
-            st.error(
-                "Por favor captura el nombre del ejecutivo, ATTUID y sube el archivo de precios."
-            )
+            st.error("Por favor captura el nombre del ejecutivo, ATTUID y sube el archivo de precios.")
         else:
             st.session_state["ejecutivo"] = ejecutivo
             st.session_state["attuid"] = attuid
@@ -820,12 +969,6 @@ st.title(
 excel_bytes = st.session_state["excel_bytes"]
 
 df_equipos_vista = get_equipos_df(excel_bytes)
-
-# ✅ Si no hay equipos vigentes con promo, detener
-if df_equipos_vista.empty:
-    st.error("No hay equipos vigentes con promoción en el archivo cargado.")
-    st.stop()
-
 lista_equipos = sorted(df_equipos_vista["Nombre Completo"].unique().tolist())
 plan_options = get_plan_options(excel_bytes)
 
@@ -834,19 +977,13 @@ col_izq, col_der = st.columns([3, 2])
 with col_izq:
     st.subheader("Datos del equipo y plan")
 
-    equipo_sel = st.selectbox("Equipo:", lista_equipos)
+    equipo_sel = st.selectbox("Equipo:", lista_equipos, key="w_equipo_sel")
 
-    precio_row = df_equipos_vista[
-        df_equipos_vista["Nombre Completo"] == equipo_sel
-    ].iloc[0]
+    precio_row = df_equipos_vista[df_equipos_vista["Nombre Completo"] == equipo_sel].iloc[0]
     precio_lista_default = float(precio_row["PrecioLista"])
     vigencia_hasta_equipo = precio_row["VigenciaHasta"]
 
-    st.text_input(
-        "Precio de contado / lista:",
-        value=f"{precio_lista_default:,.2f}",
-        disabled=True,
-    )
+    st.text_input("Precio de contado / lista:", value=f"{precio_lista_default:,.2f}", disabled=True)
     precio_lista = precio_lista_default
 
     st.text_input(
@@ -857,43 +994,47 @@ with col_izq:
 
     if plan_options:
         plan_labels = [p["plan"] for p in plan_options]
-        plan_label_sel = st.selectbox("Plan (nombre comercial):", plan_labels)
+        plan_label_sel = st.selectbox("Plan (nombre comercial):", plan_labels, key="w_plan_sel")
         selected_plan = next(p for p in plan_options if p["plan"] == plan_label_sel)
         plan_sel = selected_plan["plan"]
         plan_costo = float(selected_plan["costo"])
         plan_gb = selected_plan["gb"]
         plan_suffix = selected_plan.get("suffix", "")
     else:
-        st.warning(
-            "No se encontraron planes en el archivo. Se usará un plan sin costo."
-        )
+        st.warning("No se encontraron planes en el archivo. Se usará un plan sin costo.")
         plan_sel = "Plan sin costo"
         plan_costo = 0.0
         plan_gb = ""
         plan_suffix = ""
 
-    # ✅ Plazos disponibles SOLO desde el Excel (según columnas "XX Meses{suffix}")
+    # Plazos SOLO desde columnas de promos (aunque el valor sea NA -> cae a base)
     plan_promo_cols = [
         c for c in df_equipos_vista.columns
         if re.match(rf"^(\d+)\s*Meses{re.escape(plan_suffix)}$", str(c))
     ]
-    plazos_disponibles = sorted({int(re.match(r"^(\d+)\s*Meses", str(c)).group(1)) for c in plan_promo_cols})
+    plazos_disponibles = sorted({
+        int(re.match(r"^(\d+)\s*Meses", str(c)).group(1))
+        for c in plan_promo_cols
+    })
 
-    # Fallback: si por alguna razón no encuentra por suffix, usa todos los "Meses" del archivo
     if not plazos_disponibles:
         all_promo_cols = [c for c in df_equipos_vista.columns if "Meses" in str(c)]
-        plazos_disponibles = sorted({int(re.match(r"^(\d+)\s*Meses", str(c)).group(1)) for c in all_promo_cols})
+        plazos_disponibles = sorted({
+            int(re.match(r"^(\d+)\s*Meses", str(c)).group(1))
+            for c in all_promo_cols
+            if re.match(r"^(\d+)\s*Meses", str(c))
+        })
 
-    # Default: 24 si existe
+    if not plazos_disponibles:
+        plazos_disponibles = [24, 30, 36]
+
     default_idx = plazos_disponibles.index(24) if 24 in plazos_disponibles else 0
-
-    plazo = st.selectbox("Plazo (meses):", plazos_disponibles, index=default_idx)
+    plazo = st.selectbox("Plazo (meses):", plazos_disponibles, index=default_idx, key="w_plazo")
 
     porc_eng = st.number_input(
-        "% de enganche:", min_value=0.0, max_value=100.0, value=0.0, step=5.0
+        "% de enganche:", min_value=0.0, max_value=100.0, value=0.0, step=5.0, key="w_porc_eng"
     )
 
-    # 👉 AQUÍ se usa SIEMPRE el precio promocional real del Excel
     if st.button("Ingresar", type="primary"):
         promo = obtener_precio_promocional_equipo(precio_row, plazo, plan_suffix)
 
@@ -927,38 +1068,20 @@ with col_izq:
 
 with col_der:
     st.subheader("Datos del cliente")
-    st.session_state["cliente"] = st.text_input(
-        "Nombre del cliente:",
-        value=st.session_state["cliente"],
-    )
-    st.session_state["cliente_tel"] = st.text_input(
-        "Teléfono del cliente:",
-        value=st.session_state["cliente_tel"],
-    )
-    st.session_state["cliente_email"] = st.text_input(
-        "Correo electrónico del cliente:",
-        value=st.session_state["cliente_email"],
-    )
-    st.session_state["cliente_dir"] = st.text_area(
-        "Dirección del cliente:",
-        value=st.session_state["cliente_dir"],
-        height=60,
-    )
-    st.session_state["comentarios"] = st.text_area(
-        "Comentarios (se incluyen en el PDF):",
-        value=st.session_state["comentarios"],
-        height=80,
-    )
+    st.session_state["cliente"] = st.text_input("Nombre del cliente:", value=st.session_state["cliente"], key="w_cliente")
+    st.session_state["cliente_tel"] = st.text_input("Teléfono del cliente:", value=st.session_state["cliente_tel"], key="w_cliente_tel")
+    st.session_state["cliente_email"] = st.text_input("Correo electrónico del cliente:", value=st.session_state["cliente_email"], key="w_cliente_email")
+    st.session_state["cliente_dir"] = st.text_area("Dirección del cliente:", value=st.session_state["cliente_dir"], height=60, key="w_cliente_dir")
+    st.session_state["comentarios"] = st.text_area("Comentarios (se incluyen en el PDF):", value=st.session_state["comentarios"], height=80, key="w_comentarios")
 
     fichas_files = st.file_uploader(
         "Fichas técnicas (hasta 3 imágenes):",
         type=["png", "jpg", "jpeg"],
         accept_multiple_files=True,
+        key="w_fichas",
     )
     if fichas_files:
-        st.session_state["fichas_tecnicas"] = [
-            f.getvalue() for f in fichas_files[:3]
-        ]
+        st.session_state["fichas_tecnicas"] = [f.getvalue() for f in fichas_files[:3]]
 
 # ----------------------------------------------------
 # TABLA DE EQUIPOS
@@ -966,9 +1089,7 @@ with col_der:
 st.subheader("Resumen de equipos en la cotización")
 
 if len(st.session_state["equipos_cotizacion"]) == 0:
-    st.info(
-        "Aún no has agregado equipos. Usa el botón **Ingresar** después de capturar los datos."
-    )
+    st.info("Aún no has agregado equipos. Usa el botón **Ingresar** después de capturar los datos.")
 else:
     df_items = pd.DataFrame(st.session_state["equipos_cotizacion"])
 
@@ -1023,9 +1144,15 @@ else:
             st.session_state["fecha_validez_str"] = ""
             st.session_state["comentarios"] = ""
             st.session_state["fichas_tecnicas"] = []
-            st.info(
-                "Se inició una nueva cotización (se conservarán ejecutivo, ATTUID y archivo)."
-            )
+
+            # ✅ Reset real de widgets (sin tocar ejecutivo/attuid/excel)
+            for k in [
+                "w_cliente", "w_cliente_tel", "w_cliente_email", "w_cliente_dir", "w_comentarios",
+                "w_fichas", "w_equipo_sel", "w_plan_sel", "w_plazo", "w_porc_eng"
+            ]:
+                st.session_state.pop(k, None)
+
+            st.info("Se inició una nueva cotización (se conservarán ejecutivo, ATTUID y archivo).")
             rerun()
 
 # ----------------------------------------------------
@@ -1037,19 +1164,14 @@ if len(st.session_state["equipos_cotizacion"]) > 0:
     df_items = pd.DataFrame(st.session_state["equipos_cotizacion"])
 
     today = date.today()
-    fechas = [
-        v for v in df_items["vigencia_hasta"].tolist()
-        if isinstance(v, date)
-    ]
+    fechas = [v for v in df_items["vigencia_hasta"].tolist() if isinstance(v, date)]
     if fechas:
         vigencia_global = min(fechas)
     else:
         vigencia_global = last_day_of_month(today)
 
     dias_restantes = max(1, (vigencia_global - today).days + 1)
-
     dias_validez_pdf = min(dias_restantes, 7)
-
     vigencia_efectiva = today + timedelta(days=dias_validez_pdf - 1)
 
     st.session_state["dias_validez"] = dias_validez_pdf
@@ -1070,9 +1192,7 @@ if len(st.session_state["equipos_cotizacion"]) > 0:
     st.dataframe(df_planes_incl, width="stretch")
 
     for _, row in df_planes_incl.iterrows():
-        planes_incluidos.append(
-            dict(plan=row["PLAN"], costo=row["COSTO"], gb=row["GB"])
-        )
+        planes_incluidos.append(dict(plan=row["PLAN"], costo=row["COSTO"], gb=row["GB"]))
 else:
     st.markdown("**Vigencia de la cotización:** pendiente (sin equipos).")
 
