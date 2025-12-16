@@ -8,6 +8,9 @@ import string
 import re
 import uuid  # Para sufijo único en folios
 
+import unicodedata
+from xml.sax.saxutils import escape
+
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import (
     SimpleDocTemplate,
@@ -94,6 +97,27 @@ def parse_vigencia_cell(raw) -> date:
             pass
 
     return last_day_of_month(today)
+
+
+def pdf_safe_text(x) -> str:
+    """
+    Normalize Excel/Unicode text into something ReportLab/Helvetica renders safely.
+    Also escapes XML entities for Paragraph.
+    """
+    s = "" if x is None else str(x)
+
+    # Normalize compatibility characters to common forms
+    s = unicodedata.normalize("NFKC", s)
+
+    # Replace hyphen variants that may not exist in Helvetica
+    for ch in ["\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2212"]:
+        s = s.replace(ch, "-")
+
+    # Remove zero-width / control formatting chars
+    s = "".join(c for c in s if unicodedata.category(c) not in ("Cf", "Cc"))
+
+    # Escape XML for ReportLab Paragraph
+    return escape(s)
 
 
 @st.cache_data
@@ -507,7 +531,7 @@ def crear_pdf_cotizacion(
     if comentarios and comentarios.strip():
         comentarios_html = comentarios.replace("\n", "<br/>")
     else:
-        comentarios_html = ""
+        comentarios_html = "pendiente validación"
     story.append(Paragraph(comentarios_html, styles["Normal"]))
     story.append(Spacer(1, 8))
 
@@ -532,14 +556,14 @@ def crear_pdf_cotizacion(
     for item in equipos:
         data_equipos.append(
             [
-                Paragraph(str(item["equipo"]), styles["Normal"]),
+                Paragraph(pdf_safe_text(item["equipo"]), styles["Normal"]),
                 Paragraph(f"${item['precio_lista']:,.2f}", styles["Normal"]),
                 Paragraph(f"${item['promocion']:,.2f}", styles["Normal"]),
                 Paragraph(f"${item['ahorro']:,.2f}", styles["Normal"]),
                 Paragraph(str(item["plazo"]), styles["Normal"]),
                 Paragraph(f"{item['porc_eng']:.0f}%", styles["Normal"]),
                 Paragraph(f"${item['enganche']:,.2f}", styles["Normal"]),
-                Paragraph(str(item["plan"]), styles["Normal"]),
+                Paragraph(pdf_safe_text(item["plan"]), styles["Normal"]),
                 Paragraph(f"${item['eq_plan']:,.2f}", styles["Normal"]),
             ]
         )
@@ -585,7 +609,7 @@ def crear_pdf_cotizacion(
         for p in planes_incluidos:
             data_planes.append(
                 [
-                    Paragraph(p["plan"], styles["Normal"]),
+                    Paragraph(pdf_safe_text(p["plan"]), styles["Normal"]),
                     Paragraph(f"${p['costo']:,.2f}", styles["Normal"]),
                     Paragraph(p.get("gb", ""), styles["Normal"]),
                 ]
