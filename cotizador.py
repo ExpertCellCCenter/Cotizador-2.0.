@@ -822,7 +822,7 @@ with col_izq:
         plan_gb = ""
         plan_suffix = ""
 
-    plazo = st.selectbox("Plazo (meses):", [12, 18, 24, 30, 36], index=2)
+    plazo = st.selectbox("Plazo (meses):", [24, 30, 36], index=2)
 
     porc_eng = st.number_input(
         "% de enganche:", min_value=0.0, max_value=100.0, value=0.0, step=5.0
@@ -1041,3 +1041,4 @@ else:
         file_name="cotizacion_att.pdf",
         mime="application/pdf",
     )
+
