@@ -148,6 +148,36 @@ def _money_to_float(v):
 
 
 # ----------------------------------------------------
+# SEGURO (PRIMA MENSUAL)
+# ----------------------------------------------------
+def calcular_seguro_mensual(precio_base_seguro: float):
+    """
+    Regresa la prima mensual según el precio del equipo.
+    Si el precio es < $500 -> NO APLICA (regresa None).
+    """
+    try:
+        p = float(precio_base_seguro)
+    except Exception:
+        return None
+
+    if pd.isna(p) or p < 500:
+        return None
+
+    if 500 <= p <= 2500:
+        return 69.0
+    if 2501 <= p <= 4000:
+        return 99.0
+    if 4001 <= p <= 6000:
+        return 139.0
+    if 6001 <= p <= 13000:
+        return 199.0
+    if p >= 13001:
+        return 239.0
+
+    return None
+
+
+# ----------------------------------------------------
 # EXCEL: PROMOCIONES AT&T PREMIUM
 # ----------------------------------------------------
 @st.cache_data
@@ -401,6 +431,19 @@ def get_plan_options(excel_bytes: bytes):
         options.append(dict(plan=label, costo=p, gb=gb, suffix=suffix))
 
     return options
+
+
+def _promo_valida_para_plan(row_equipo: pd.Series, plazo: int, plan_suffix: str) -> bool:
+    """True si hay valor numérico (no NA/NaN) en la columna promo del plan/plazo."""
+    base = f"{plazo} Meses"
+    col_promo = base + (plan_suffix if plan_suffix else "")
+    if col_promo not in row_equipo.index:
+        return False
+    try:
+        v = float(row_equipo[col_promo])
+        return (not pd.isna(v))
+    except Exception:
+        return False
 
 
 def obtener_precio_promocional_equipo(row_equipo: pd.Series, plazo: int, plan_suffix: str):
@@ -673,29 +716,51 @@ def crear_pdf_cotizacion(
 
     story.append(Paragraph("<b>Resumen de equipos</b>", styles["HeaderBig"]))
 
-    columnas_equipos = [
-        "EQUIPO", "PRECIO LISTA", "PROMOCIÓN", "AHORRO", "PLAZO", "% ENG", "ENGANCHE", "PLAN", "EQUIPO + PLAN"
-    ]
+    any_seguro = any(bool(it.get("seguro_selected", False)) for it in (equipos or []))
+
+    if any_seguro:
+        columnas_equipos = [
+            "EQUIPO", "PRECIO LISTA", "PROMOCIÓN", "AHORRO", "PLAZO", "% ENG",
+            "ENGANCHE", "PLAN", "EQUIPO + PLAN", "SEGURO", "TOTAL MENSUAL"
+        ]
+    else:
+        columnas_equipos = [
+            "EQUIPO", "PRECIO LISTA", "PROMOCIÓN", "AHORRO", "PLAZO", "% ENG",
+            "ENGANCHE", "PLAN", "EQUIPO + PLAN"
+        ]
 
     header_row = [Paragraph(col, styles["HeaderSmall"]) for col in columnas_equipos]
     data_equipos = [header_row]
 
     for item in equipos:
-        data_equipos.append(
-            [
-                Paragraph(pdf_safe_text(item["equipo"]), styles["Normal"]),
-                Paragraph(f"${item['precio_lista']:,.2f}", styles["Normal"]),
-                Paragraph(f"${item['promocion']:,.2f}", styles["Normal"]),
-                Paragraph(f"${item['ahorro']:,.2f}", styles["Normal"]),
-                Paragraph(str(item["plazo"]), styles["Normal"]),
-                Paragraph(f"{item['porc_eng']:.0f}%", styles["Normal"]),
-                Paragraph(f"${item['enganche']:,.2f}", styles["Normal"]),
-                Paragraph(pdf_safe_text(item["plan"]), styles["Normal"]),
-                Paragraph(f"${item['eq_plan']:,.2f}", styles["Normal"]),
-            ]
-        )
+        row = [
+            Paragraph(pdf_safe_text(item["equipo"]), styles["Normal"]),
+            Paragraph(f"${item['precio_lista']:,.2f}", styles["Normal"]),
+            Paragraph(f"${item['promocion']:,.2f}", styles["Normal"]),
+            Paragraph(f"${item['ahorro']:,.2f}", styles["Normal"]),
+            Paragraph(str(item["plazo"]), styles["Normal"]),
+            Paragraph(f"{item['porc_eng']:.0f}%", styles["Normal"]),
+            Paragraph(f"${item['enganche']:,.2f}", styles["Normal"]),
+            Paragraph(pdf_safe_text(item["plan"]), styles["Normal"]),
+            Paragraph(f"${item['eq_plan']:,.2f}", styles["Normal"]),
+        ]
 
-    col_widths_equipos = scale_widths([53, 20, 20, 17, 12, 12, 18, 15, 17])
+        if any_seguro:
+            seguro_disp = item.get("seguro_display", "No Aplica")
+            total_m = float(item.get("total_mensual", item["eq_plan"]))
+            row.extend(
+                [
+                    Paragraph(pdf_safe_text(seguro_disp), styles["Normal"]),
+                    Paragraph(f"${total_m:,.2f}", styles["Normal"]),
+                ]
+            )
+
+        data_equipos.append(row)
+
+    if any_seguro:
+        col_widths_equipos = scale_widths([32, 27, 27, 25, 15, 15, 22, 17, 22, 20, 22])
+    else:
+        col_widths_equipos = scale_widths([45, 27, 27, 17, 17, 17, 17, 17, 17])
 
     tabla_equipos = Table(data_equipos, colWidths=col_widths_equipos, repeatRows=1)
     tabla_equipos.setStyle(
@@ -991,6 +1056,8 @@ with col_izq:
 
     porc_eng = st.number_input("% de enganche:", min_value=0.0, max_value=100.0, value=0.0, step=5.0)
 
+    agregar_seguro = st.checkbox("Agregar seguro de protección (opcional)")
+
     if st.button("Ingresar", type="primary"):
         promo = obtener_precio_promocional_equipo(precio_row, plazo, plan_suffix)
 
@@ -1005,6 +1072,31 @@ with col_izq:
             else:
                 pago_equipo_mensual = 0.0
             equipo_mas_plan = pago_equipo_mensual + float(plan_costo)
+
+            # ---------------- SEGURO (por equipo) ----------------
+            seguro_selected = bool(agregar_seguro)
+
+            # Si hay promoción válida para ese plan/plazo -> usar promo para calcular seguro
+            # Si NO hay promo válida -> usar Precio Lista para calcular seguro
+            promo_valida = _promo_valida_para_plan(precio_row, plazo, plan_suffix)
+            precio_base_seguro = float(promo) if promo_valida else float(precio_lista)
+
+            if seguro_selected:
+                seguro_mensual = calcular_seguro_mensual(precio_base_seguro)
+                if seguro_mensual is None:
+                    seguro_no_aplica = True
+                    seguro_mensual_num = 0.0
+                    seguro_display = "No Aplica"
+                else:
+                    seguro_no_aplica = False
+                    seguro_mensual_num = float(seguro_mensual)
+                    seguro_display = f"${seguro_mensual_num:,.2f}"
+            else:
+                seguro_no_aplica = False
+                seguro_mensual_num = 0.0
+                seguro_display = "Sin seguro"  # ✅ antes salía $0.00 en escenarios mixtos
+
+            total_mensual = float(equipo_mas_plan) + (seguro_mensual_num if (seguro_selected and not seguro_no_aplica) else 0.0)
 
             st.session_state["equipos_cotizacion"].append(
                 dict(
@@ -1021,6 +1113,13 @@ with col_izq:
                     plan_gb=plan_gb,
                     vigencia_hasta=vigencia_hasta_equipo,
                     plan_suffix=plan_suffix,
+
+                    # ✅ seguro
+                    seguro_selected=seguro_selected,
+                    seguro_no_aplica=seguro_no_aplica,
+                    seguro_mensual=seguro_mensual_num,
+                    seguro_display=seguro_display,
+                    total_mensual=total_mensual,
                 )
             )
             st.success("Equipo agregado a la cotización.")
@@ -1052,31 +1151,57 @@ if len(st.session_state["equipos_cotizacion"]) == 0:
 else:
     df_items = pd.DataFrame(st.session_state["equipos_cotizacion"])
 
-    df_mostrar = pd.DataFrame(
-        {
-            "EQUIPO": df_items["equipo"],
-            "PRECIO LISTA": df_items["precio_lista"],
-            "PROMOCIÓN": df_items["promocion"],
-            "AHORRO": df_items["ahorro"],
-            "PLAZO": df_items["plazo"],
-            "% ENG": df_items["porc_eng"],
-            "ENGANCHE": df_items["enganche"],
-            "PLAN": df_items["plan"],
-            "EQUIPO + PLAN": df_items["eq_plan"],
-        }
-    )
+    any_seguro = False
+    if "seguro_selected" in df_items.columns:
+        try:
+            any_seguro = bool(df_items["seguro_selected"].fillna(False).astype(bool).any())
+        except Exception:
+            any_seguro = False
+
+    if any_seguro:
+        df_mostrar = pd.DataFrame(
+            {
+                "EQUIPO": df_items["equipo"],
+                "PRECIO LISTA": df_items["precio_lista"],
+                "PROMOCIÓN": df_items["promocion"],
+                "AHORRO": df_items["ahorro"],
+                "PLAZO": df_items["plazo"],
+                "% ENG": df_items["porc_eng"],
+                "ENGANCHE": df_items["enganche"],
+                "PLAN": df_items["plan"],
+                "EQUIPO + PLAN": df_items["eq_plan"],
+                "SEGURO": df_items.get("seguro_display", "No Aplica"),
+                "TOTAL MENSUAL": df_items.get("total_mensual", df_items["eq_plan"]),
+            }
+        )
+    else:
+        df_mostrar = pd.DataFrame(
+            {
+                "EQUIPO": df_items["equipo"],
+                "PRECIO LISTA": df_items["precio_lista"],
+                "PROMOCIÓN": df_items["promocion"],
+                "AHORRO": df_items["ahorro"],
+                "PLAZO": df_items["plazo"],
+                "% ENG": df_items["porc_eng"],
+                "ENGANCHE": df_items["enganche"],
+                "PLAN": df_items["plan"],
+                "EQUIPO + PLAN": df_items["eq_plan"],
+            }
+        )
+
+    fmt = {
+        "PRECIO LISTA": "${:,.2f}",
+        "PROMOCIÓN": "${:,.2f}",
+        "AHORRO": "${:,.2f}",
+        "ENGANCHE": "${:,.2f}",
+        "EQUIPO + PLAN": "${:,.2f}",
+        "% ENG": "{:.0f}%",
+    }
+    if any_seguro:
+        fmt["TOTAL MENSUAL"] = "${:,.2f}"
 
     st.dataframe(
-        df_mostrar.style.format(
-            {
-                "PRECIO LISTA": "${:,.2f}",
-                "PROMOCIÓN": "${:,.2f}",
-                "AHORRO": "${:,.2f}",
-                "ENGANCHE": "${:,.2f}",
-                "EQUIPO + PLAN": "${:,.2f}",
-                "% ENG": "{:.0f}%",
-            }
-        ),
+        df_mostrar.style.format(fmt),
         width="stretch",
     )
 
