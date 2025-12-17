@@ -758,7 +758,7 @@ def crear_pdf_cotizacion(
         data_equipos.append(row)
 
     if any_seguro:
-        col_widths_equipos = scale_widths([32, 27, 27, 25, 17, 15, 24, 17, 22, 20, 22])
+        col_widths_equipos = scale_widths([32, 27, 27, 25, 17, 15, 24, 19, 22, 20, 22])
     else:
         col_widths_equipos = scale_widths([45, 27, 27, 17, 17, 17, 17, 17, 17])
 
