@@ -102,7 +102,7 @@ def parse_vigencia_cell(raw) -> date:
 def _normalize_key(s: str) -> str:
     """
     Normaliza nombres para poder hacer match entre:
-      - AT&T Premium (Modelo / Nombre Completo)
+      - AT&T Premium (Modelo/Nombre Completo)
       - Promociones AT&T Premium (Equipo)
     Deja solo A-Z0-9 en MAYÚSCULAS y sin acentos.
     """
@@ -112,29 +112,6 @@ def _normalize_key(s: str) -> str:
     s = s.upper()
     s = re.sub(r"[^A-Z0-9]+", "", s)
     return s
-
-
-# ----------------------------------------------------
-# MATCH HELPERS (robust Modelo/Escenario)
-# ----------------------------------------------------
-_MATCH_IGNORE = {
-    "ATT", "AT", "T",
-    "AZUL", "NEGRO", "BLANCO", "ROJO", "VERDE", "GRIS", "PLATA", "DORADO", "MORADO", "ROSA", "AMARILLO",
-    "OCEANO", "OCÉANO",
-}
-
-def _tokens_for_match(s: str) -> set:
-    """
-    Tokeniza texto para match robusto entre 'Equipo' (promos) y 'Modelo/Nombre Completo' (base).
-    """
-    s = "" if s is None else str(s)
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.upper()
-
-    toks = re.findall(r"[A-Z0-9]+", s)
-    toks = [t for t in toks if t and t not in _MATCH_IGNORE]
-    return set(toks)
 
 
 def pdf_safe_text(x) -> str:
@@ -224,12 +201,14 @@ def get_promociones_premium_df(excel_bytes: bytes) -> pd.DataFrame:
     plan_suffixes = ["", "2", "3", "4", "5", "6", "7", "8"]
     promo_cols = []
 
+    # ✅ OJO: en esta hoja los importes suelen venir como "$13,918.70"
+    # por eso se debe usar _money_to_float (NO pd.to_numeric directo).
     for i, suf in enumerate(plan_suffixes):
         base_col = 7 + i * 3
         for j, plazo in enumerate([24, 30, 36]):
             col_idx = base_col + j
             col_name = f"{plazo} Meses{suf}"
-            out[col_name] = data[col_idx].apply(_money_to_float)  # NA/$ -> NaN/float
+            out[col_name] = data[col_idx].apply(_money_to_float)  # "$..." / "NA" -> float/NaN
             promo_cols.append(col_name)
 
     today = date.today()
@@ -260,6 +239,7 @@ def get_equipos_df(excel_bytes: bytes) -> pd.DataFrame:
     ✅ Reglas:
       - Si promo = NA/NaN -> usar el precio BASE del mismo plan/plazo en AT&T Premium.
       - Si equipo NO aparece en promociones -> usar BASE (AT&T Premium).
+      - Si promo y base son NA/NaN -> NO APLICA (se manejará al presionar Ingresar).
       - Vigencia final:
           si existe FechaFin promo -> min(FechaFin promo, vigencia base)
           si no -> vigencia base
@@ -267,25 +247,16 @@ def get_equipos_df(excel_bytes: bytes) -> pd.DataFrame:
     """
     df = pd.read_excel(BytesIO(excel_bytes), sheet_name="AT&T Premium", header=4)
 
-    # Columna de nombre: algunos archivos usan "Nombre Completo", otros "Modelo"
-    if "Nombre Completo" in df.columns:
-        name_col = "Nombre Completo"
-    elif "Modelo" in df.columns:
-        name_col = "Modelo"
-    else:
-        name_col = df.columns[0]
+    # Mantener lo que ya existía, pero si hay "Modelo" también lo leemos para match más robusto
+    base_cols = ["Nombre Completo", "Precio de Contado"]
+    if "Modelo" in df.columns:
+        base_cols = ["Nombre Completo", "Modelo", "Precio de Contado"]
 
-    base_cols = [name_col, "Precio de Contado"]
     df = df[base_cols + [c for c in df.columns if c not in base_cols]].copy()
 
-    # Estandarizamos a "Nombre Completo" para el resto del app
-    df["Nombre Completo"] = df[name_col].astype(str).str.strip()
-
-    # Asegura columna "Modelo" para match (si no existe, la dejamos vacía)
+    df["Nombre Completo"] = df["Nombre Completo"].astype(str).str.strip()
     if "Modelo" in df.columns:
         df["Modelo"] = df["Modelo"].astype(str).str.strip()
-    else:
-        df["Modelo"] = ""
 
     # Precio de contado -> numérico limpio
     price = df["Precio de Contado"]
@@ -304,6 +275,15 @@ def get_equipos_df(excel_bytes: bytes) -> pd.DataFrame:
 
     df = df.dropna(subset=["Nombre Completo", "PrecioLista"])
     df = df[df["Nombre Completo"].str.len() > 0].copy()
+
+    # ✅ Match key: preferir "Modelo" (porque Promociones suele traer solo el modelo),
+    # si no existe, usar "Nombre Completo".
+    if "Modelo" in df.columns:
+        df["MatchName"] = df["Modelo"]
+    else:
+        df["MatchName"] = df["Nombre Completo"]
+
+    df["BaseKey"] = df["MatchName"].apply(_normalize_key)
 
     # ✅ Guardar precios BASE por plan/plazo (de AT&T Premium) como Base_...
     base_promo_cols = [c for c in df.columns if re.match(r"^\s*\d+\s*Meses\d*\s*$", str(c))]
@@ -327,58 +307,35 @@ def get_equipos_df(excel_bytes: bytes) -> pd.DataFrame:
         base_keep = [c for c in base_keep if c in out.columns]
         return out[["Nombre Completo", "PrecioLista", "VigenciaHasta"] + base_keep]
 
-    # ✅ Keys de match: usar Modelo + Nombre Completo + fallback por tokens
-    df["BaseKeyFull"] = df["Nombre Completo"].apply(_normalize_key)
-    df["BaseKeyModel"] = df["Modelo"].apply(_normalize_key)
-
     promo_keys = promos["PromoKey"].tolist()
-    promo_order = sorted(range(len(promo_keys)), key=lambda i: len(promo_keys[i]), reverse=True)
-    promo_tokens = [_tokens_for_match(x) for x in promos["PromoEquipo"].astype(str).tolist()]
 
-    def _find_promo_idx(full_key: str, model_key: str, full_name: str, model_name: str):
-        full_key = full_key or ""
-        model_key = model_key or ""
-
-        # 1) Match fuerte: promo_key dentro de Modelo o Nombre Completo
-        for i in promo_order:
-            pk = promo_keys[i]
-            if pk and (pk in model_key or pk in full_key):
-                return i
-
-        # 2) Fallback por tokens
-        base_tokens = _tokens_for_match(model_name) | _tokens_for_match(full_name)
+    def _find_promo_idx(base_key: str):
+        """
+        Match robusto:
+        - pk in base_key  OR  base_key in pk
+        - Escoge el mejor candidato por overlap y cercanía de longitud
+        """
+        if not base_key:
+            return None
 
         best_i = None
-        best_score = 0
+        best_score = None
 
-        for i in promo_order:
-            inter = base_tokens & promo_tokens[i]
-            if not inter:
+        for i, pk in enumerate(promo_keys):
+            if not pk:
                 continue
 
-            if len(inter) >= 2:
-                score = sum(len(t) for t in inter)
-            else:
-                longest = max((len(t) for t in inter), default=0)
-                if longest < 8:
-                    continue
-                score = longest
-
-            if score > best_score:
-                best_score = score
-                best_i = i
+            if (pk in base_key) or (base_key in pk):
+                overlap = min(len(pk), len(base_key))
+                length_gap = abs(len(pk) - len(base_key))
+                score = (overlap, -length_gap, -len(pk))  # mayor overlap, menor gap, menor pk
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_i = i
 
         return best_i
 
-    df["_promo_i"] = df.apply(
-        lambda r: _find_promo_idx(
-            r["BaseKeyFull"],
-            r["BaseKeyModel"],
-            r["Nombre Completo"],
-            r["Modelo"],
-        ),
-        axis=1,
-    )
+    df["_promo_i"] = df["BaseKey"].apply(_find_promo_idx)
 
     promos2 = promos.reset_index().rename(columns={"index": "_promo_i"})
     df = df.merge(promos2, on="_promo_i", how="left")
@@ -446,12 +403,12 @@ def get_plan_options(excel_bytes: bytes):
     return options
 
 
-def obtener_precio_promocional_equipo(row_equipo: pd.Series, plazo: int, plan_suffix: str) -> float:
+def obtener_precio_promocional_equipo(row_equipo: pd.Series, plazo: int, plan_suffix: str):
     """
-    ✅ Nueva regla pedida:
+    ✅ Regla correcta:
     - Si hay promo numérica -> usar promo.
-    - Si promo es NA/NaN o no existe -> usar BASE del mismo plan/plazo en AT&T Premium (Base_...).
-    - Si tampoco hay base -> usar PrecioLista.
+    - Si promo es NA/NaN o no existe -> usar BASE del mismo plan/plazo (Base_...).
+    - Si BASE también es NA/NaN -> NO APLICA (regresa None).
     """
     base = f"{plazo} Meses"
     col_promo = base + (plan_suffix if plan_suffix else "")
@@ -475,8 +432,8 @@ def obtener_precio_promocional_equipo(row_equipo: pd.Series, plazo: int, plan_su
         except (TypeError, ValueError):
             pass
 
-    # 3) contado/lista
-    return float(row_equipo["PrecioLista"])
+    # 3) promo y base son NA -> NO APLICA
+    return None
 
 
 def generar_folio(fecha: datetime) -> str:
@@ -711,6 +668,7 @@ def crear_pdf_cotizacion(
         comentarios_html = pdf_safe_text(comentarios).replace("\n", "<br/>")
         story.append(Paragraph(comentarios_html, styles["Normal"]))
 
+    # si está vacío, no imprime nada debajo del título
     story.append(Spacer(1, 8))
 
     story.append(Paragraph("<b>Resumen de equipos</b>", styles["HeaderBig"]))
@@ -977,7 +935,7 @@ col_izq, col_der = st.columns([3, 2])
 with col_izq:
     st.subheader("Datos del equipo y plan")
 
-    equipo_sel = st.selectbox("Equipo:", lista_equipos, key="w_equipo_sel")
+    equipo_sel = st.selectbox("Equipo:", lista_equipos)
 
     precio_row = df_equipos_vista[df_equipos_vista["Nombre Completo"] == equipo_sel].iloc[0]
     precio_lista_default = float(precio_row["PrecioLista"])
@@ -994,7 +952,7 @@ with col_izq:
 
     if plan_options:
         plan_labels = [p["plan"] for p in plan_options]
-        plan_label_sel = st.selectbox("Plan (nombre comercial):", plan_labels, key="w_plan_sel")
+        plan_label_sel = st.selectbox("Plan (nombre comercial):", plan_labels)
         selected_plan = next(p for p in plan_options if p["plan"] == plan_label_sel)
         plan_sel = selected_plan["plan"]
         plan_costo = float(selected_plan["costo"])
@@ -1029,56 +987,57 @@ with col_izq:
         plazos_disponibles = [24, 30, 36]
 
     default_idx = plazos_disponibles.index(24) if 24 in plazos_disponibles else 0
-    plazo = st.selectbox("Plazo (meses):", plazos_disponibles, index=default_idx, key="w_plazo")
+    plazo = st.selectbox("Plazo (meses):", plazos_disponibles, index=default_idx)
 
-    porc_eng = st.number_input(
-        "% de enganche:", min_value=0.0, max_value=100.0, value=0.0, step=5.0, key="w_porc_eng"
-    )
+    porc_eng = st.number_input("% de enganche:", min_value=0.0, max_value=100.0, value=0.0, step=5.0)
 
     if st.button("Ingresar", type="primary"):
         promo = obtener_precio_promocional_equipo(precio_row, plazo, plan_suffix)
 
-        ahorro = max(precio_lista - promo, 0.0)
-        enganche_mxn = promo * (porc_eng / 100.0)
-        if plazo > 0:
-            pago_equipo_mensual = (promo - enganche_mxn) / plazo
+        # ✅ NO APLICA (promo y base NA/NaN)
+        if promo is None:
+            st.error("❌ No Aplica para ese PLAN y PLAZO (NA en base y sin promoción válida).")
         else:
-            pago_equipo_mensual = 0.0
-        equipo_mas_plan = pago_equipo_mensual + float(plan_costo)
+            ahorro = max(precio_lista - promo, 0.0)
+            enganche_mxn = promo * (porc_eng / 100.0)
+            if plazo > 0:
+                pago_equipo_mensual = (promo - enganche_mxn) / plazo
+            else:
+                pago_equipo_mensual = 0.0
+            equipo_mas_plan = pago_equipo_mensual + float(plan_costo)
 
-        st.session_state["equipos_cotizacion"].append(
-            dict(
-                equipo=equipo_sel,
-                precio_lista=precio_lista,
-                promocion=promo,
-                ahorro=ahorro,
-                plazo=plazo,
-                porc_eng=porc_eng,
-                enganche=enganche_mxn,
-                plan=plan_sel,
-                eq_plan=equipo_mas_plan,
-                plan_costo=float(plan_costo),
-                plan_gb=plan_gb,
-                vigencia_hasta=vigencia_hasta_equipo,
-                plan_suffix=plan_suffix,
+            st.session_state["equipos_cotizacion"].append(
+                dict(
+                    equipo=equipo_sel,
+                    precio_lista=precio_lista,
+                    promocion=promo,
+                    ahorro=ahorro,
+                    plazo=plazo,
+                    porc_eng=porc_eng,
+                    enganche=enganche_mxn,
+                    plan=plan_sel,
+                    eq_plan=equipo_mas_plan,
+                    plan_costo=float(plan_costo),
+                    plan_gb=plan_gb,
+                    vigencia_hasta=vigencia_hasta_equipo,
+                    plan_suffix=plan_suffix,
+                )
             )
-        )
-        st.success("Equipo agregado a la cotización.")
+            st.success("Equipo agregado a la cotización.")
 
 
 with col_der:
     st.subheader("Datos del cliente")
-    st.session_state["cliente"] = st.text_input("Nombre del cliente:", value=st.session_state["cliente"], key="w_cliente")
-    st.session_state["cliente_tel"] = st.text_input("Teléfono del cliente:", value=st.session_state["cliente_tel"], key="w_cliente_tel")
-    st.session_state["cliente_email"] = st.text_input("Correo electrónico del cliente:", value=st.session_state["cliente_email"], key="w_cliente_email")
-    st.session_state["cliente_dir"] = st.text_area("Dirección del cliente:", value=st.session_state["cliente_dir"], height=60, key="w_cliente_dir")
-    st.session_state["comentarios"] = st.text_area("Comentarios (se incluyen en el PDF):", value=st.session_state["comentarios"], height=80, key="w_comentarios")
+    st.session_state["cliente"] = st.text_input("Nombre del cliente:", value=st.session_state["cliente"])
+    st.session_state["cliente_tel"] = st.text_input("Teléfono del cliente:", value=st.session_state["cliente_tel"])
+    st.session_state["cliente_email"] = st.text_input("Correo electrónico del cliente:", value=st.session_state["cliente_email"])
+    st.session_state["cliente_dir"] = st.text_area("Dirección del cliente:", value=st.session_state["cliente_dir"], height=60)
+    st.session_state["comentarios"] = st.text_area("Comentarios (se incluyen en el PDF):", value=st.session_state["comentarios"], height=80)
 
     fichas_files = st.file_uploader(
         "Fichas técnicas (hasta 3 imágenes):",
         type=["png", "jpg", "jpeg"],
         accept_multiple_files=True,
-        key="w_fichas",
     )
     if fichas_files:
         st.session_state["fichas_tecnicas"] = [f.getvalue() for f in fichas_files[:3]]
@@ -1144,14 +1103,6 @@ else:
             st.session_state["fecha_validez_str"] = ""
             st.session_state["comentarios"] = ""
             st.session_state["fichas_tecnicas"] = []
-
-            # ✅ Reset real de widgets (sin tocar ejecutivo/attuid/excel)
-            for k in [
-                "w_cliente", "w_cliente_tel", "w_cliente_email", "w_cliente_dir", "w_comentarios",
-                "w_fichas", "w_equipo_sel", "w_plan_sel", "w_plazo", "w_porc_eng"
-            ]:
-                st.session_state.pop(k, None)
-
             st.info("Se inició una nueva cotización (se conservarán ejecutivo, ATTUID y archivo).")
             rerun()
 
