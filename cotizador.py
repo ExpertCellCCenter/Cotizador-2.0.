@@ -866,6 +866,8 @@ def crear_pdf_cotizacion(
         canvas.setFillColor(colors.HexColor("#00AEEF"))
         canvas.rect(x_bar, y_bar, bar_width, bar_height, fill=1, stroke=0)
 
+        # --- Logo (tal cual) ---
+        logo_drawn = False
         if os.path.exists(logo_path):
             logo_height = 6 * mm
             logo_width = 16 * mm
@@ -879,11 +881,77 @@ def crear_pdf_cotizacion(
                 preserveAspectRatio=True,
                 mask="auto",
             )
+            logo_drawn = True
         else:
             canvas.setFont("Helvetica-Bold", 9)
             canvas.setFillColor(colors.black)
             canvas.drawString(x_bar, y_bar + bar_height + 3, "AT&T")
 
+        # --- Link legend + clickable hyperlink (SIN SOBREPOSICIÓN) ---
+        from reportlab.pdfbase import pdfmetrics  # import local para no tocar nada más
+
+        link_prefix = (
+            "Si desea continuar con la cotización diríjase a este link para subir los documentos complementarios (INE):"
+        )
+        link_url = "https://cotizacionfotos.streamlit.app/"
+
+        font_name = "Helvetica"
+        font_size = 7
+        leading = font_size + 1.5
+
+        # Si hay logo, dibuja a la derecha del logo; si no, deja margen a la derecha del texto "AT&T"
+        if logo_drawn:
+            x_text = x_bar + logo_width + 3 * mm
+            y_top = y_logo + logo_height - 1 * mm
+        else:
+            x_text = x_bar + 18 * mm
+            y_top = (y_bar + bar_height) + 7 * mm
+
+        max_w = (page_width - doc_.rightMargin) - x_text
+
+        def _wrap_text(txt: str, max_width: float):
+            words = txt.split()
+            lines, line = [], ""
+            for w in words:
+                test = (line + " " + w).strip()
+                if pdfmetrics.stringWidth(test, font_name, font_size) <= max_width:
+                    line = test
+                else:
+                    if line:
+                        lines.append(line)
+                    line = w
+            if line:
+                lines.append(line)
+            return lines
+
+        prefix_lines = _wrap_text(link_prefix, max_w)
+
+        canvas.setFont(font_name, font_size)
+        canvas.setFillColor(colors.black)
+
+        y = y_top
+        for ln in prefix_lines:
+            canvas.drawString(x_text, y, ln)
+            y -= leading
+
+        # URL line (blue + underline) + clickable area
+        canvas.setFillColor(colors.HexColor("#0066CC"))
+        canvas.drawString(x_text, y, link_url)
+
+        url_w = pdfmetrics.stringWidth(link_url, font_name, font_size)
+        canvas.setStrokeColor(colors.HexColor("#0066CC"))
+        canvas.setLineWidth(0.6)
+        canvas.line(x_text, y - 1, x_text + url_w, y - 1)
+
+        # clickable hyperlink rectangle (x1, y1, x2, y2)
+        canvas.linkURL(
+            link_url,
+            (x_text, y - 2, x_text + url_w, y + font_size + 2),
+            relative=0,
+            thickness=0,
+        )
+
+        # --- Vigencia (tal cual) ---
         canvas.setFont("Helvetica-Bold", 8)
         canvas.setFillColor(colors.white)
         canvas.drawRightString(
@@ -1076,10 +1144,11 @@ with col_izq:
             # ---------------- SEGURO (por equipo) ----------------
             seguro_selected = bool(agregar_seguro)
 
-            # Si hay promoción válida para ese plan/plazo -> usar promo para calcular seguro
-            # Si NO hay promo válida -> usar Precio Lista para calcular seguro
-            promo_valida = _promo_valida_para_plan(precio_row, plazo, plan_suffix)
-            precio_base_seguro = float(promo) if promo_valida else float(precio_lista)
+            # Si el equipo tiene promoción (ahorro > 0) -> usar promo para calcular seguro
+            # Si NO tiene promoción -> usar Precio Lista para calcular seguro
+            tiene_promocion = float(ahorro) > 0.0
+            precio_base_seguro = float(promo) if tiene_promocion else float(precio_lista)
+
 
             if seguro_selected:
                 seguro_mensual = calcular_seguro_mensual(precio_base_seguro)
