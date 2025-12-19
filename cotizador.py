@@ -896,7 +896,7 @@ def crear_pdf_cotizacion(
         link_url = "https://cotizacionfotos.streamlit.app/"
 
         font_name = "Helvetica"
-        font_size = 7
+        font_size = 10
         leading = font_size + 1.5
 
         # Si hay logo, dibuja a la derecha del logo; si no, deja margen a la derecha del texto "AT&T"
@@ -1371,3 +1371,4 @@ else:
         file_name="cotizacion_att.pdf",
         mime="application/pdf",
     )
+
